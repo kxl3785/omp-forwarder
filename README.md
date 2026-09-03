@@ -6,6 +6,8 @@ dashboard for the traffic Studio can no longer see.
 
 Windows, Python 3.10+, no required dependencies.
 
+![The dashboard at /__stats](assets/dashboard.png)
+
 ## The problem
 
 Unsloth Studio serves an OpenAI-compatible API on `:8888`. That endpoint is a
@@ -116,6 +118,24 @@ buying nothing), in-flight and queued requests, largest context seen, and the
 forwarder's own request count, median round trip, and **HTTP 4xx/5xx counts**.
 That last one matters: `llama-server`'s `/metrics` has no error counter, so a
 500 from a chat template is otherwise completely silent.
+
+### Per stream
+
+`/metrics` only aggregates, so with several requests in flight it cannot tell
+you which one is slow. The per-stream table reads `/slots` instead and gives
+each concurrent request its own row: tok/s, tokens generated, context size,
+how much of that context came from cache, and how much of its token budget is
+left.
+
+It also separates **prefill** from **decode**, which matters more than it
+sounds. A slot showing `decoded = 0` is not idle — it is evaluating its prompt,
+and on a long one that is most of the request. The table reports its prefill
+rate there rather than a misleading "0 tok/s", and marks slots that are merely
+`queued` behind other work.
+
+Measured with two requests running side by side: 45.7 and 51.4 tok/s,
+aggregate 97.2. Only decode rates are summed — adding a prefill rate to a
+decode rate would produce a number that means nothing.
 
 Every `llama-server` counter is cumulative since the server started, which is
 the wrong window when you want to know what just happened. Each section has a

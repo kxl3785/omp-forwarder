@@ -64,6 +64,44 @@ def upstream_metrics(port: int | None) -> dict:
         return {}
 
 
+def upstream_slots(port: int | None) -> list[dict]:
+    """Per-slot state from llama-server's /slots.
+
+    This is the only source of PER-STREAM throughput. /metrics aggregates
+    everything, so with several requests in flight it cannot tell you that one
+    stream is running at 66 tok/s on a 107k-token context while another does
+    59 on 45k. The counter is next_token[0].n_decoded, which the page
+    differences.
+
+    id_task matters: n_decoded restarts when a slot picks up a new request, so
+    a rate is only meaningful while id_task is unchanged."""
+    if not port:
+        return []
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/slots", timeout=4) as r:
+            raw = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for s in raw:
+        nt = s.get("next_token") or [{}]
+        nt = nt[0] if isinstance(nt, list) and nt else {}
+        out.append({
+            "id": s.get("id"),
+            "task": s.get("id_task"),
+            "busy": bool(s.get("is_processing")),
+            "decoded": nt.get("n_decoded", 0),
+            "remain": nt.get("n_remain", 0),
+            "prompt": s.get("n_prompt_tokens", 0),
+            "cached": s.get("n_prompt_tokens_cache", 0),
+            "spec": bool(s.get("speculative")),
+        })
+    return out
+
+
 def upstream_model(port: int | None) -> str:
     if not port:
         return "-"
@@ -119,6 +157,8 @@ def snapshot(fwd, stats: dict) -> dict:
         "processing": g("llamacpp:requests_processing", 0),
         "deferred": g("llamacpp:requests_deferred", 0),
         "tokens_max": g("llamacpp:n_tokens_max", 0),
+        # Per-stream, from /slots. /metrics cannot give this.
+        "slots": upstream_slots(port),
     }
 
 
@@ -183,6 +223,25 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
 .since{font-family:var(--mono);font-size:9.5px;color:var(--teal);
   letter-spacing:.02em;text-transform:none}
 .stale{opacity:.4;transition:opacity .3s}
+/* Per-stream rows. A table rather than cards: the point is comparing slots
+   against each other, and columns do that better than tiles. */
+.slots{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  overflow:hidden}
+.slots table{width:100%;border-collapse:collapse}
+.slots th{font-size:9.5px;letter-spacing:.1em;color:var(--dim);
+  text-transform:uppercase;font-weight:600;text-align:right;
+  padding:10px 16px 8px;border-bottom:1px solid var(--line)}
+.slots th:first-child{text-align:left}
+.slots td{font-family:var(--mono);font-size:14px;text-align:right;
+  padding:9px 16px;border-bottom:1px solid rgba(29,52,64,.5);
+  font-variant-numeric:tabular-nums}
+.slots tr:last-child td{border-bottom:0}
+.slots td:first-child{text-align:left;color:var(--dim);font-size:12px}
+.slots .rate{color:var(--teal);font-size:17px}
+.slots .dim{color:var(--dim)}
+.slots tfoot td{border-top:1px solid var(--line);border-bottom:0;
+  color:var(--ink)}
+.quiet{padding:16px;color:var(--dim);font-size:12px}
 .foot{margin-top:24px;padding-top:15px;border-top:1px solid var(--line);
   color:var(--dim);font-size:12px;line-height:1.65}
 .foot b{color:var(--ink);font-weight:600}
@@ -249,6 +308,10 @@ omp forwarder</h1>
   <div class="card"><div class="k">Largest context</div>
     <div class="v" id="tmax">&mdash;</div><div class="n">tokens, high water</div></div>
 </div>
+
+<h2>Per stream &mdash; from /slots<span class="rule"></span>
+  <span class="since" id="slots_n"></span></h2>
+<div id="slots" class="slots"><div class="quiet">no stream is generating</div></div>
 
 <h2>Forwarder &mdash; what only it can see<span class="rule"></span>
   <span class="since" id="since-fwd"></span>
@@ -386,6 +449,8 @@ async function tick(){
                                       : "vs 1.00 without speculation"; }
   else { $("tpp").textContent="—"; $("tpp_n").textContent="no passes yet"; }
 
+  renderSlots(s);
+
   if(prev){
     const dg=s.gen_tokens-prev.gen_tokens, dsec=s.gen_seconds-prev.gen_seconds;
     const dp=s.prompt_tokens-prev.prompt_tokens, dps=s.prompt_seconds-prev.prompt_seconds;
@@ -425,6 +490,69 @@ async function tick(){
 }
 function meterSet(el,pct,warn,bad){el.style.width=Math.max(0,Math.min(100,pct))+"%";
   el.className = pct<bad?"bad":(pct<warn?"warn":"");}
+
+// Per-slot rates need their own history: n_decoded restarts whenever a slot
+// takes a new request, so a delta is only valid while id_task is unchanged.
+const slotHist=new Map();
+function renderSlots(s){
+  const rows=[], slots=(s.slots||[]).filter(x=>x.busy);
+  let total=0, haveRate=false;
+  for(const sl of slots){
+    const h=slotHist.get(sl.id);
+    // Also require the phase to be unchanged. A window that straddles the
+    // prefill -> decode boundary is mostly prefill, so it reports a decode
+    // rate of ~1 tok/s on a long prompt, which is true of the window and
+    // badly misleading about the stream.
+    const wasDecoding = h && h.decoded>0;
+    const same = h && h.task===sl.task && s.t>h.t
+                 && wasDecoding===(sl.decoded>0);
+    // decoded==0 means the slot is still evaluating its prompt, not idle.
+    // Reporting "0 tok/s" there would be a lie; its prompt is growing, and
+    // that growth rate IS its prefill speed.
+    const phase = sl.decoded>0 ? "decode" : "prefill";
+    let rate=null;
+    if(same){
+      rate = phase==="decode" ? (sl.decoded-h.decoded)/(s.t-h.t)
+                              : (sl.prompt-h.prompt)/(s.t-h.t);
+      if(!(rate>0)) rate=null;
+      if(rate!=null && phase==="decode"){ total+=rate; haveRate=true; }
+    }
+    slotHist.set(sl.id,{task:sl.task,decoded:sl.decoded,prompt:sl.prompt,t:s.t});
+    const hit = sl.prompt>0 ? (100*sl.cached/sl.prompt) : null;
+    rows.push("<tr>"
+      +`<td>slot ${sl.id}${sl.spec?"":' <span class="dim">no spec</span>'}</td>`
+      +`<td class="dim">${phase}${(phase==="prefill"&&rate==null)?" · queued":""}</td>`
+      +`<td class="rate">${rate==null?'<span class="dim">…</span>':fmt(rate)}</td>`
+      +`<td>${Math.round(sl.decoded).toLocaleString()}</td>`
+      +`<td>${Math.round(sl.prompt).toLocaleString()}</td>`
+      +`<td>${hit==null?'<span class="dim">—</span>':hit.toFixed(0)+"%"}</td>`
+      +`<td class="dim">${Math.round(sl.remain).toLocaleString()}</td>`
+      +"</tr>");
+  }
+  // Slots that finished should not keep stale history around.
+  const live=new Set(slots.map(x=>x.id));
+  for(const k of Array.from(slotHist.keys())) if(!live.has(k)) slotHist.delete(k);
+
+  const box=document.getElementById("slots");
+  const note=document.getElementById("slots_n");
+  if(!rows.length){
+    box.innerHTML='<div class="quiet">no stream is generating</div>';
+    note.textContent = (s.slots||[]).length ? ((s.slots||[]).length+" slots idle") : "";
+    return;
+  }
+  note.textContent = rows.length+" of "+(s.slots||[]).length+" slots busy";
+  box.innerHTML="<table><thead><tr>"
+    +"<th>stream</th><th>phase</th><th>tok/s</th><th>generated</th>"
+    +"<th>context</th><th>cached</th><th>budget left</th></tr></thead><tbody>"
+    +rows.join("")+"</tbody>"
+    // Only decode rates are summed. Adding a prefill rate to a decode rate
+    // would produce a number that means nothing.
+    +(rows.length>1 && haveRate
+       ? '<tfoot><tr><td>aggregate</td><td class="dim">decode</td>'
+         +`<td class="rate">${total.toFixed(1)}</td><td colspan="4"></td></tr></tfoot>`
+       : "")
+    +"</table>";
+}
 tick(); setInterval(tick,3000);
 </script>
 """
