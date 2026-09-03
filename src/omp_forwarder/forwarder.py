@@ -63,19 +63,25 @@ _upstream: int | None = None
 #: silent -- which is exactly how a real template bug went unnoticed.
 _stats: dict = {"conns": 0, "requests": 0, "2xx": 0, "4xx": 0, "5xx": 0,
                 "fallbacks": 0, "latency": [], "model": "",
-                "tok_prompt": 0, "tok_gen": 0,
+                "tok_prompt": 0, "tok_cached": 0, "tok_gen": 0,
                 "started": time.time()}
 
 #: The /metrics sample the token tally was last folded from, as
-#: (port, prompt_tokens_total, tokens_predicted_total). See _tally_tokens.
-_tok_last: tuple[int, float, float] | None = None
+#: (port, prompt_tokens_total, prompt_tokens_cached_total,
+#: tokens_predicted_total). See _tally_tokens.
+_tok_last: tuple[int, float, float, float] | None = None
 _tok_lock = threading.Lock()
 #: Set when a relayed request completes; the sampler thread waits on it.
 _tok_dirty = threading.Event()
 
 #: Per-day token totals, so the figure survives restarts and can be compared
-#: with a paid API's daily usage. {"YYYY-MM-DD": {"prompt": n, "gen": n}},
-#: persisted to TOKENS_FILE (beside the log). Guarded by _tok_lock.
+#: with a paid API's daily usage.
+#: {"YYYY-MM-DD": {"prompt": n, "cached": n, "gen": n}}, persisted to
+#: TOKENS_FILE (beside the log). Guarded by _tok_lock.
+#:
+#: "prompt" and "cached" are DISJOINT, which is what makes the comparison
+#: work: llama-server counts a prompt token in exactly one of them, so they
+#: line up with a paid API's "input" and "cache read" lines.
 TOKENS_FILE: str | None = None
 _day_totals: dict = {}
 _days_dirty = False
@@ -109,7 +115,10 @@ def _load_days() -> None:
     except (OSError, ValueError):
         return                      # first run, or unreadable: start empty
     if isinstance(raw, dict):
+        # "cached" is absent in files written before it was tracked; those
+        # days keep a 0 rather than being dropped.
         _day_totals = {d: {"prompt": int(v.get("prompt", 0)),
+                           "cached": int(v.get("cached", 0)),
                            "gen": int(v.get("gen", 0))}
                        for d, v in raw.items() if isinstance(v, dict)}
 
@@ -131,16 +140,27 @@ def _save_days() -> None:
         log(f"cannot write {TOKENS_FILE}: {exc!r}")
 
 
-def _today_tokens() -> tuple[int, int]:
+def _today_tokens() -> tuple[int, int, int]:
+    """(prompt, cached, generated) for today, across restarts."""
     with _tok_lock:
         d = _day_totals.get(_today(), {})
-        return d.get("prompt", 0), d.get("gen", 0)
+        return d.get("prompt", 0), d.get("cached", 0), d.get("gen", 0)
+
+
+def recent_days(limit: int = 30) -> list[dict]:
+    """Newest first, for the usage page. A copy: the caller must not hold
+    the lock while rendering."""
+    with _tok_lock:
+        days = sorted(_day_totals.items(), reverse=True)[:limit]
+    return [{"day": d, "prompt": v.get("prompt", 0),
+             "cached": v.get("cached", 0), "gen": v.get("gen", 0)}
+            for d, v in days]
 
 
 def _log_day(day: str, suffix: str = "") -> None:
     d = _day_totals.get(day, {})
     log(f"tokens {day}{suffix}: {d.get('prompt', 0):,} prompt, "
-        f"{d.get('gen', 0):,} generated")
+        f"{d.get('cached', 0):,} cached, {d.get('gen', 0):,} generated")
 
 
 def log(msg: str) -> None:
@@ -251,17 +271,21 @@ def _tally_tokens(port: int | None, metrics: dict,
     if not port or not metrics:
         return
     prompt = metrics.get("llamacpp:prompt_tokens_total", 0.0)
+    cached = metrics.get("llamacpp:prompt_tokens_cached_total", 0.0)
     gen = metrics.get("llamacpp:tokens_predicted_total", 0.0)
     with _tok_lock:
         last = _tok_last
-        _tok_last = (port, prompt, gen)
+        _tok_last = (port, prompt, cached, gen)
         if baseline:
             return
-        if (last is None or last[0] != port
-                or prompt < last[1] or gen < last[2]):
-            last = (port, 0.0, 0.0)
-        dp, dg = int(prompt - last[1]), int(gen - last[2])
+        if (last is None or last[0] != port or prompt < last[1]
+                or cached < last[2] or gen < last[3]):
+            last = (port, 0.0, 0.0, 0.0)
+        dp = int(prompt - last[1])
+        dc = int(cached - last[2])
+        dg = int(gen - last[3])
         _stats["tok_prompt"] += dp
+        _stats["tok_cached"] += dc
         _stats["tok_gen"] += dg
         # Per-day book-keeping. The finished day is logged at the first
         # sample of the next one, which is the earliest moment we know it
@@ -270,9 +294,11 @@ def _tally_tokens(port: int | None, metrics: dict,
         if _last_day and day != _last_day:
             _log_day(_last_day)
         _last_day = day
-        if dp or dg:
-            t = _day_totals.setdefault(day, {"prompt": 0, "gen": 0})
+        if dp or dc or dg:
+            t = _day_totals.setdefault(day, {"prompt": 0, "cached": 0,
+                                             "gen": 0})
             t["prompt"] += dp
+            t["cached"] = t.get("cached", 0) + dc
             t["gen"] += dg
             _days_dirty = True
 
@@ -364,18 +390,27 @@ def _read_request_head(client: socket.socket) -> bytes:
     return head
 
 
+#: Paths the forwarder answers itself instead of relaying.
+LOCAL_PREFIXES = ("/__stats", "/__usage")
+
+
 def _serve_local(client: socket.socket, path: str) -> None:
-    """Serve the dashboard (/__stats) and its data (/__stats.json)."""
+    """Serve the live dashboard (/__stats), the usage page (/__usage), and
+    the JSON both of them poll (/__stats.json)."""
     from . import stats as stats_mod
     # sys.modules[__name__] rather than importing this module by name: under
     # some entry points that would build a SECOND module object with its own
     # _upstream, which then reads as None while the real one is serving.
     me = sys.modules[__name__]
-    if path.startswith("/__stats.json"):
+    if path.startswith(("/__stats.json", "/__usage.json")):
         if not _stats.get("model"):
             _stats["model"] = stats_mod.upstream_model(_upstream)
         body = json.dumps(stats_mod.snapshot(me, _stats)).encode()
         ctype = "application/json"
+    elif path.startswith("/__usage"):
+        from . import usage as usage_mod
+        body = usage_mod.PAGE.encode("utf-8")
+        ctype = "text/html; charset=utf-8"
     else:
         body = stats_mod.PAGE.encode("utf-8")
         ctype = "text/html; charset=utf-8"
@@ -403,7 +438,7 @@ def handle(client: socket.socket) -> None:
         target = head.split(b" ", 2)[1].decode("latin-1")
     except IndexError:
         target = ""
-    if target.startswith("/__stats"):
+    if target.startswith(LOCAL_PREFIXES):
         _serve_local(client, target)
         client.close()
         return
@@ -541,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
     srv.listen(128)
     log(f"listening on {HOST}:{LISTEN_PORT}")
     log(f"stats at http://{HOST}:{LISTEN_PORT}/__stats")
+    log(f"usage at http://{HOST}:{LISTEN_PORT}/__usage")
     if os.name != "nt" and not FORCED_UPSTREAM:
         log("WARNING: auto-discovery is Windows-only; pass --upstream-port")
     log(f"initial upstream: {discover(force=True)}")

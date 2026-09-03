@@ -82,7 +82,7 @@ def reset_state() -> None:
     fwd._stats.clear()
     fwd._stats.update({"conns": 0, "requests": 0, "2xx": 0, "4xx": 0,
                        "5xx": 0, "fallbacks": 0, "latency": [], "model": "",
-                       "tok_prompt": 0, "tok_gen": 0,
+                       "tok_prompt": 0, "tok_cached": 0, "tok_gen": 0,
                        "started": time.time()})
     fwd._tok_last = None
     fwd._tok_dirty.clear()

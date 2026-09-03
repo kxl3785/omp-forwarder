@@ -151,6 +151,34 @@ class RelayTests(RelayCase):
         self.assertEqual(fwd._stats["requests"], 0)
         self.assertEqual(fwd._stats["conns"], 1)
 
+    def test_usage_page_is_served_locally(self):
+        up = self.fake()
+        fwd.FORCED_UPSTREAM = up.port
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=10)
+        conn.request("GET", "/__usage")
+        r = conn.getresponse()
+        body = r.read()
+        self.assertEqual(r.status, 200)
+        self.assertIn("text/html", r.getheader("Content-Type"))
+        self.assertIn(b"omp forwarder &mdash; usage", body)
+        # It polls the same snapshot the live dashboard uses, so there is no
+        # second endpoint to keep in step.
+        self.assertIn(b"/__stats.json", body)
+        self.assertEqual(up.received, [])
+        self.assertEqual(fwd._stats["requests"], 0)
+
+    def test_usage_json_returns_the_snapshot(self):
+        up = self.fake()
+        fwd.FORCED_UPSTREAM = up.port
+        conn = http.client.HTTPConnection(HOST, self.port, timeout=10)
+        conn.request("GET", "/__usage.json")
+        r = conn.getresponse()
+        d = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertIn("tok_today_cached", d)
+        self.assertIn("days", d)
+        self.assertEqual(fwd._stats["requests"], 0)
+
     def test_stats_json_reports_upstream_and_counters(self):
         def responder(method, path, raw):
             if path == "/health":

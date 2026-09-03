@@ -17,8 +17,9 @@ from omp_forwarder import stats
 from .helpers import ForwarderCase, RelayCase, http_response, raw_request
 
 
-def m(prompt: float, gen: float) -> dict:
+def m(prompt: float, gen: float, cached: float = 0.0) -> dict:
     return {"llamacpp:prompt_tokens_total": float(prompt),
+            "llamacpp:prompt_tokens_cached_total": float(cached),
             "llamacpp:tokens_predicted_total": float(gen)}
 
 
@@ -26,12 +27,17 @@ def tally() -> tuple[int, int]:
     return fwd._stats["tok_prompt"], fwd._stats["tok_gen"]
 
 
+def tally3() -> tuple[int, int, int]:
+    return (fwd._stats["tok_prompt"], fwd._stats["tok_cached"],
+            fwd._stats["tok_gen"])
+
+
 class TallyTests(ForwarderCase):
 
     def test_baseline_records_without_adding(self):
         fwd._tally_tokens(5000, m(100, 50), baseline=True)
         self.assertEqual(tally(), (0, 0))
-        self.assertEqual(fwd._tok_last, (5000, 100.0, 50.0))
+        self.assertEqual(fwd._tok_last, (5000, 100.0, 0.0, 50.0))
 
     def test_adds_deltas_on_the_same_port(self):
         fwd._tally_tokens(5000, m(100, 50), baseline=True)
@@ -71,7 +77,78 @@ class TallyTests(ForwarderCase):
     def test_missing_counters_read_as_zero(self):
         fwd._tally_tokens(5000, {"llamacpp:n_decode_total": 3.0})
         self.assertEqual(tally(), (0, 0))
-        self.assertEqual(fwd._tok_last, (5000, 0.0, 0.0))
+        self.assertEqual(fwd._tok_last, (5000, 0.0, 0.0, 0.0))
+
+
+class CachedTallyTests(ForwarderCase):
+    """Reused prompt tokens are tallied separately from fresh ones.
+
+    That separation is the whole point: llama-server puts a prompt token in
+    exactly one of the two counters, so they map onto a paid API's "input"
+    and "cache read" lines without any estimating."""
+
+    def test_cached_tokens_are_tallied_apart_from_fresh_ones(self):
+        fwd._tally_tokens(5000, m(100, 50, cached=1000), baseline=True)
+        fwd._tally_tokens(5000, m(120, 60, cached=9000))
+        self.assertEqual(tally3(), (20, 8000, 10))
+
+    def test_a_reload_counts_the_new_process_cache_whole(self):
+        fwd._tally_tokens(5000, m(100, 50, cached=1000), baseline=True)
+        fwd._tally_tokens(6000, m(10, 5, cached=700))
+        self.assertEqual(tally3(), (10, 700, 5))
+
+    def test_cache_going_backwards_alone_restarts_the_tally(self):
+        # Prompt and generated may sit still while the cache counter drops,
+        # which still means a new process.
+        fwd._tally_tokens(5000, m(100, 50, cached=9000), baseline=True)
+        fwd._tally_tokens(5000, m(100, 50, cached=20))
+        self.assertEqual(tally3(), (100, 20, 50))
+
+    def test_day_totals_carry_the_cache(self):
+        with mock.patch.object(fwd, "_today", return_value="2026-09-03"):
+            fwd._tally_tokens(5000, m(100, 50, cached=1000), baseline=True)
+            fwd._tally_tokens(5000, m(150, 70, cached=6000))
+            self.assertEqual(
+                fwd._day_totals,
+                {"2026-09-03": {"prompt": 50, "cached": 5000, "gen": 20}})
+            self.assertEqual(fwd._today_tokens(), (50, 5000, 20))
+
+    def test_a_cache_only_change_still_records_a_day(self):
+        # A fully cached prompt moves nothing but the cache counter. It is
+        # still usage, so the day must appear.
+        with mock.patch.object(fwd, "_today", return_value="2026-09-03"):
+            fwd._tally_tokens(5000, m(100, 50, cached=0), baseline=True)
+            fwd._tally_tokens(5000, m(100, 50, cached=4000))
+        self.assertEqual(fwd._day_totals,
+                         {"2026-09-03": {"prompt": 0, "cached": 4000,
+                                         "gen": 0}})
+
+
+class RecentDaysTests(ForwarderCase):
+
+    def test_newest_first_and_capped(self):
+        fwd._day_totals = {f"2026-09-{d:02d}": {"prompt": d, "cached": 2 * d,
+                                                "gen": 3 * d}
+                           for d in range(1, 11)}
+        days = fwd.recent_days(3)
+        self.assertEqual([d["day"] for d in days],
+                         ["2026-09-10", "2026-09-09", "2026-09-08"])
+        self.assertEqual(days[0], {"day": "2026-09-10", "prompt": 10,
+                                   "cached": 20, "gen": 30})
+
+    def test_empty_and_missing_cache_key(self):
+        self.assertEqual(fwd.recent_days(5), [])
+        fwd._day_totals = {"2026-09-03": {"prompt": 4, "gen": 1}}
+        self.assertEqual(fwd.recent_days(5),
+                         [{"day": "2026-09-03", "prompt": 4, "cached": 0,
+                           "gen": 1}])
+
+    def test_snapshot_carries_the_days(self):
+        fwd._day_totals = {"2026-09-02": {"prompt": 1, "cached": 2, "gen": 3},
+                           "2026-09-03": {"prompt": 4, "cached": 5, "gen": 6}}
+        d = stats.snapshot(fwd, fwd._stats)
+        self.assertEqual([x["day"] for x in d["days"]],
+                         ["2026-09-03", "2026-09-02"])
 
 
 class DayTotalsTests(ForwarderCase):
@@ -84,9 +161,10 @@ class DayTotalsTests(ForwarderCase):
             fwd._tally_tokens(5000, m(160, 80))
             fwd._tally_tokens(5000, m(160, 80))     # no change: no entry churn
             fwd._tally_tokens(5000, m(200, 90))
-            self.assertEqual(fwd._day_totals,
-                             {"2026-09-03": {"prompt": 100, "gen": 40}})
-            self.assertEqual(fwd._today_tokens(), (100, 40))
+            self.assertEqual(
+                fwd._day_totals,
+                {"2026-09-03": {"prompt": 100, "cached": 0, "gen": 40}})
+            self.assertEqual(fwd._today_tokens(), (100, 0, 40))
         self.assertTrue(fwd._days_dirty)
 
     def test_baseline_touches_no_day(self):
@@ -103,23 +181,26 @@ class DayTotalsTests(ForwarderCase):
                 mock.patch.object(fwd, "log") as logged:
             fwd._tally_tokens(5000, m(135, 62))
         self.assertEqual(fwd._day_totals, {
-            "2026-09-03": {"prompt": 30, "gen": 10},
-            "2026-09-04": {"prompt": 5, "gen": 2}})
+            "2026-09-03": {"prompt": 30, "cached": 0, "gen": 10},
+            "2026-09-04": {"prompt": 5, "cached": 0, "gen": 2}})
         msgs = [c.args[0] for c in logged.call_args_list]
-        self.assertEqual(msgs, ["tokens 2026-09-03: 30 prompt, 10 generated"])
+        self.assertEqual(
+            msgs, ["tokens 2026-09-03: 30 prompt, 0 cached, 10 generated"])
 
     def test_save_and_load_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             fwd.TOKENS_FILE = os.path.join(tmp, "sub", "tokens.json")
-            fwd._day_totals = {"2026-09-02": {"prompt": 7, "gen": 3},
-                               "2026-09-03": {"prompt": 100, "gen": 40}}
+            fwd._day_totals = {
+                "2026-09-02": {"prompt": 7, "cached": 2, "gen": 3},
+                "2026-09-03": {"prompt": 100, "cached": 900, "gen": 40}}
             fwd._days_dirty = True
             fwd._save_days()
             self.assertFalse(fwd._days_dirty)
             self.assertFalse(os.path.exists(fwd.TOKENS_FILE + ".tmp"))
             with open(fwd.TOKENS_FILE, encoding="utf-8") as fh:
                 on_disk = json.load(fh)
-            self.assertEqual(on_disk["2026-09-03"], {"prompt": 100, "gen": 40})
+            self.assertEqual(on_disk["2026-09-03"],
+                             {"prompt": 100, "cached": 900, "gen": 40})
             fwd._day_totals = {}
             fwd._load_days()
             self.assertEqual(fwd._day_totals, on_disk)
@@ -133,20 +214,24 @@ class DayTotalsTests(ForwarderCase):
                 fh.write("{not json")
             fwd._load_days()
             self.assertEqual(fwd._day_totals, {})
+            # A file written before "cached" existed: the day is kept, and
+            # the missing counter reads 0 rather than dropping the row.
             with open(fwd.TOKENS_FILE, "w", encoding="utf-8") as fh:
                 json.dump({"2026-09-03": {"prompt": "12", "gen": 4},
                            "junk": 5}, fh)
             fwd._load_days()
-            self.assertEqual(fwd._day_totals,
-                             {"2026-09-03": {"prompt": 12, "gen": 4}})
+            self.assertEqual(
+                fwd._day_totals,
+                {"2026-09-03": {"prompt": 12, "cached": 0, "gen": 4}})
 
     def test_no_tokens_file_means_no_disk_io(self):
         fwd.TOKENS_FILE = None
-        fwd._day_totals = {"2026-09-03": {"prompt": 1, "gen": 1}}
+        fwd._day_totals = {"2026-09-03": {"prompt": 1, "cached": 0, "gen": 1}}
         fwd._days_dirty = True
         fwd._save_days()                       # must not raise
         fwd._load_days()
-        self.assertEqual(fwd._day_totals, {"2026-09-03": {"prompt": 1, "gen": 1}})
+        self.assertEqual(fwd._day_totals,
+                         {"2026-09-03": {"prompt": 1, "cached": 0, "gen": 1}})
 
     def test_default_path_sits_beside_the_log(self):
         with mock.patch.dict(os.environ, {"OMP_FORWARDER_LOG":

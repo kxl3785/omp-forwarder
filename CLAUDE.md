@@ -10,6 +10,7 @@ waste your time if you do not know them.
 src/omp_forwarder/
   forwarder.py   the relay, port discovery, CLI. Owns module-level state.
   stats.py       /__stats dashboard: the HTML page and the JSON snapshot.
+  usage.py       /__usage page. Polls /__stats.json; no endpoint of its own.
   tray.py        Windows tray icon (win32gui). Imported lazily, only for --tray.
   make_icon.py   generates assets/omp-forwarder.ico. Pure stdlib, no Pillow.
 assets/          the .ico, and the README screenshot
@@ -112,7 +113,13 @@ replace `tasklist` and `netstat` with recorded output, so they run on any OS.
 runner. `_serve_forever` returns when its listener is closed only so the tests
 can stop it.
 
-Not covered: the tray, `make_icon`, the dashboard's JavaScript, and anything
+**`prompt_tokens_total` and `prompt_tokens_cached_total` are disjoint.**
+llama-server puts a prompt token in exactly one of them. That is what lets
+`/__usage` map them onto a paid API's "input" and "cache read" lines without
+estimating. Do not add them together and call it "prompt tokens submitted"
+unless you mean the sum of both.
+
+Not covered: the tray, `make_icon`, the two pages' JavaScript, and anything
 that needs a live llama-server (real `/metrics` names, real `/slots` shapes).
 For those, verify by hand and say what you actually ran:
 

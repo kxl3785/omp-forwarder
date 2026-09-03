@@ -193,6 +193,24 @@ the local model instead of a paid one. It is a count of what `llama-server`
 did while the forwarder was running, so requests from Studio's own UI or from
 another client land in it too.
 
+### Usage
+
+`http://127.0.0.1:8890/__usage` answers a different question from the live
+dashboard: how much work went to the local model instead of a paid API.
+
+It works because `llama-server` counts every prompt token in exactly one of two
+places, read fresh or reused from a warm slot. Those are the same two lines a
+paid API bills as **input** and **cache read**, so the breakdown is a mapping
+rather than an estimate. There is no cache-write row: populating a local cache
+costs nothing extra, and a paid API charges a premium for it, so a real bill
+would come out slightly above the figure shown.
+
+The page gives today's totals, a breakdown across today, the last seven days
+and everything recorded, a per-day history, and what the whole lot would have
+cost at rates you can edit. Presets cover a few current models; the rates are
+list prices stored in your browser. Read the dollar figure as an order of
+magnitude, because two models split the same text into different tokens.
+
 Per-day totals survive restarts. They live in `tokens.json` beside the log
 (`%LOCALAPPDATA%\omp-forwarder\` with `run_forwarder.bat`; `--tokens-file`
 overrides), written within 30 seconds of a change and at exit. The log gets one

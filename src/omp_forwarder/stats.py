@@ -132,7 +132,8 @@ def snapshot(fwd, stats: dict) -> dict:
     if tally:
         tally(port, m)
     today = getattr(fwd, "_today_tokens", None)
-    today_p, today_g = today() if today else (0, 0)
+    today_p, today_c, today_g = today() if today else (0, 0, 0)
+    days_fn = getattr(fwd, "recent_days", None)
     lat = sorted(list(stats.get("latency", ()))[-200:])
     g = m.get
     slots = upstream_slots(port)
@@ -156,10 +157,14 @@ def snapshot(fwd, stats: dict) -> dict:
         # The forwarder's own tally: survives model reloads, which restart
         # every llama-server counter at zero.
         "tok_prompt": stats.get("tok_prompt", 0),
+        "tok_cached": stats.get("tok_cached", 0),
         "tok_gen": stats.get("tok_gen", 0),
         # Today's totals across restarts, from the forwarder's tokens.json.
         "tok_today_prompt": today_p,
+        "tok_today_cached": today_c,
         "tok_today_gen": today_g,
+        # Newest first. Feeds the usage page's history and its totals.
+        "days": days_fn(30) if days_fn else [],
         # --- cumulative, straight from llama-server ---
         "gen_tokens": g("llamacpp:tokens_predicted_total", 0),
         "gen_seconds": g("llamacpp:tokens_predicted_seconds_total", 0),

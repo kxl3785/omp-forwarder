@@ -60,11 +60,6 @@
 <text class="on-amber" x="478" y="68">finds it: tasklist + netstat + GET /health, re-run whenever a connect fails</text>
 
 <!-- ROW 2 -->
-<rect class="panel" x="316" y="286" width="212" height="92" rx="12"/>
-<text class="h" x="336" y="316">Dashboard</text>
-<text class="port" x="336" y="336">/__stats</text>
-<text class="s" x="336" y="361">answered locally, not relayed</text>
-
 <rect class="panel" x="636" y="286" width="212" height="92" rx="12"/>
 <text class="h" x="656" y="316">Unsloth Studio</text>
 <text class="port" x="656" y="336">127.0.0.1:8888</text>
@@ -76,8 +71,8 @@
 <text class="on-grey" x="752" y="256">here too</text>
 
 <!-- forwarder -> studio fallback -->
-<path class="aux" d="M422,194 L422,240 L580,240 L580,332 L630,332" marker-end="url(#amber)"/>
-<text class="on-amber" x="430" y="234">fallback when no model is loaded</text>
+<path class="aux" d="M422,194 L422,332 L630,332" marker-end="url(#amber)"/>
+<text class="on-amber" x="430" y="316">fallback when no model is loaded</text>
 
 <!-- client -> studio, the replaced path -->
 <path class="slow" d="M120,188 L120,420 L790,420 L790,382" marker-end="url(#grey)"/>
