@@ -93,7 +93,8 @@ python -m unittest            # from the repo root; ~20 s, no dependencies
 ```
 
 `tests/__init__.py` puts `src/` on `sys.path`, so a clone works with nothing
-installed. Nothing in the suite talks to a real llama-server: `tests/helpers.py`
+installed. GitHub Actions runs the same command on Ubuntu and Windows, Python
+3.10 and 3.13, on every push to main (`.github/workflows/tests.yml`). Nothing in the suite talks to a real llama-server: `tests/helpers.py`
 has `FakeUpstream`, a TCP server that speaks just enough HTTP to stand in for
 one, and `RelayCase`, which starts the relay on a free port. Discovery tests
 replace `tasklist` and `netstat` with recorded output, so they run on any OS.

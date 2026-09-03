@@ -1,5 +1,7 @@
 # OMP Forwarder
 
+[![tests](https://github.com/kxl3785/omp-forwarder/actions/workflows/tests.yml/badge.svg)](https://github.com/kxl3785/omp-forwarder/actions/workflows/tests.yml)
+
 A fixed local port in front of Unsloth Studio's `llama-server`, so your client
 talks to the model directly instead of through Studio's proxy — with a live
 dashboard for the traffic Studio can no longer see.

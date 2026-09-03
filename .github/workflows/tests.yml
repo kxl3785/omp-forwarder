@@ -1,0 +1,41 @@
+# Runs the unittest suite. No dependencies to install: the forwarder has none,
+# and tests/__init__.py puts src/ on sys.path itself.
+#
+# Both OSes matter. Discovery shells out to tasklist/netstat on Windows and
+# the tests replace those with recorded output, so they must pass on Linux
+# too; and the relay's socket handling differs enough between the two
+# (loopback refuse timing, socketpair emulation) that one OS hides bugs in
+# the other.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        # requires-python is >=3.10; test the floor and the newest release.
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Compile every Python file
+        run: python -m compileall -q src tests bench
+      - name: Unit tests
+        run: python -m unittest -v
+      - name: Icon renders
+        # Pure stdlib; prints an ASCII preview. Catches a broken import in
+        # make_icon without needing a display.
+        run: python -m omp_forwarder.make_icon > /dev/null
+        shell: bash
+        env:
+          PYTHONPATH: src
