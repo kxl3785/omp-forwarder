@@ -98,6 +98,8 @@ def upstream_slots(port: int | None) -> list[dict]:
             "prompt": s.get("n_prompt_tokens", 0),
             "cached": s.get("n_prompt_tokens_cache", 0),
             "spec": bool(s.get("speculative")),
+            # With --kv-unified this is the whole pool, shared by every slot.
+            "n_ctx": s.get("n_ctx", 0),
         })
     return out
 
@@ -124,9 +126,19 @@ def snapshot(fwd, stats: dict) -> dict:
     baseline for session figures. Both need the raw counter."""
     port = getattr(fwd, "_upstream", None)
     m = upstream_metrics(port)
+    # The page's poll doubles as a sample for the token tally, so the Tokens
+    # card is live while the dashboard is open. See forwarder._tally_tokens.
+    tally = getattr(fwd, "_tally_tokens", None)
+    if tally:
+        tally(port, m)
+    today = getattr(fwd, "_today_tokens", None)
+    today_p, today_g = today() if today else (0, 0)
     lat = sorted(list(stats.get("latency", ()))[-200:])
     g = m.get
+    slots = upstream_slots(port)
     return {
+        # Context window: llama-server's n_ctx, the same on every slot.
+        "ctx": max((s["n_ctx"] for s in slots), default=0),
         "t": time.time(),
         "uptime_s": int(time.time() - stats.get("started", _STARTED)),
         "upstream": port,
@@ -141,6 +153,13 @@ def snapshot(fwd, stats: dict) -> dict:
         "status_5xx": stats.get("5xx", 0),
         "latency_p50_ms": round(lat[len(lat) // 2] * 1000, 1) if lat else None,
         "fallbacks": stats.get("fallbacks", 0),
+        # The forwarder's own tally: survives model reloads, which restart
+        # every llama-server counter at zero.
+        "tok_prompt": stats.get("tok_prompt", 0),
+        "tok_gen": stats.get("tok_gen", 0),
+        # Today's totals across restarts, from the forwarder's tokens.json.
+        "tok_today_prompt": today_p,
+        "tok_today_gen": today_g,
         # --- cumulative, straight from llama-server ---
         "gen_tokens": g("llamacpp:tokens_predicted_total", 0),
         "gen_seconds": g("llamacpp:tokens_predicted_seconds_total", 0),
@@ -158,7 +177,7 @@ def snapshot(fwd, stats: dict) -> dict:
         "deferred": g("llamacpp:requests_deferred", 0),
         "tokens_max": g("llamacpp:n_tokens_max", 0),
         # Per-stream, from /slots. /metrics cannot give this.
-        "slots": upstream_slots(port),
+        "slots": slots,
     }
 
 
@@ -306,7 +325,7 @@ omp forwarder</h1>
     <div class="v" id="tpp">&mdash;</div>
     <div class="n" id="tpp_n">speculation payoff</div></div>
   <div class="card"><div class="k">Largest context</div>
-    <div class="v" id="tmax">&mdash;</div><div class="n">tokens, high water</div></div>
+    <div class="v" id="tmax">&mdash;</div><div class="n" id="tmax_n">tokens, high water</div></div>
 </div>
 
 <h2>Per stream &mdash; from /slots<span class="rule"></span>
@@ -317,6 +336,8 @@ omp forwarder</h1>
   <span class="since" id="since-fwd"></span>
   <button class="rst" data-sect="fwd" title="Count from now"><svg><use href="#ico-rst"/></svg>Session</button></h2>
 <div class="grid">
+  <div class="card"><div class="k">Tokens</div>
+    <div class="v" id="tok">&mdash;</div><div class="n" id="tok_n">prompt + generated</div></div>
   <div class="card"><div class="k">Requests</div>
     <div class="v" id="req">&mdash;</div><div class="n" id="conn_n">&nbsp;</div></div>
   <div class="card"><div class="k">Round trip</div>
@@ -343,7 +364,12 @@ omp forwarder</h1>
   nothing on the server. A <span class="tag">lifetime</span> tag means nothing
   finished in the last few seconds, so that figure is a running average rather
   than a live rate. Round trip is already a rolling median, and largest context
-  is a high&#8209;water mark, so neither is baselined.
+  is a high&#8209;water mark, so neither is baselined.<br>
+  <b>Tokens</b> is the forwarder&rsquo;s own tally, folded from successive
+  <code>/metrics</code> samples, so it survives model reloads &mdash; every
+  llama&#8209;server counter restarts at zero on one. It counts only traffic
+  since the forwarder started; a reload loses at most the few seconds since the
+  last sample.
 </div>
 </div>
 <script>
@@ -360,7 +386,8 @@ const KEYS={
   model:["gen_tokens","gen_seconds","prompt_tokens","prompt_seconds",
          "draft_total","draft_accepted","drafts","decode_steps"],
   server:["prompt_cached","prompt_tokens","gen_tokens","decode_steps"],
-  fwd:["requests","conns","status_2xx","status_4xx","status_5xx","fallbacks"]
+  fwd:["requests","conns","status_2xx","status_4xx","status_5xx","fallbacks",
+       "tok_prompt","tok_gen"]
 };
 const STORE="ompfwd.baseline.v1";
 let base={model:null,server:null,fwd:null};
@@ -423,7 +450,21 @@ async function tick(){
   $("inflight").textContent=s.processing;
   $("inflight_n").textContent=s.deferred>0?(s.deferred+" queued"):(s.processing>0?"busy":"idle");
   $("tmax").textContent=Math.round(s.tokens_max).toLocaleString();
+  $("tmax_n").textContent = s.ctx>0
+    ? "high water · window "+Math.round(s.ctx).toLocaleString()
+    : "tokens, high water";
 
+  const tok=F.tok_prompt+F.tok_gen;
+  $("tok").textContent=Math.round(tok).toLocaleString();
+  let tokNote = tok>0
+    ? Math.round(F.tok_prompt).toLocaleString()+" prompt · "+Math.round(F.tok_gen).toLocaleString()+" generated"
+    : "prompt + generated";
+  // Today's figure survives forwarder restarts; show it only when it differs
+  // from the since-start total, i.e. when the forwarder restarted today.
+  const today=(s.tok_today_prompt||0)+(s.tok_today_gen||0);
+  if(today>0 && Math.round(today)!==Math.round(s.tok_prompt+s.tok_gen))
+    tokNote += " · today "+Math.round(today).toLocaleString();
+  $("tok_n").textContent = tokNote;
   $("req").textContent=F.requests;
   $("conn_n").textContent=F.conns+" connections"+(F.fallbacks?(" · "+F.fallbacks+" via Studio"):"");
   $("e5").textContent=F.status_5xx; $("e4").textContent=F.status_4xx;
@@ -449,7 +490,7 @@ async function tick(){
                                       : "vs 1.00 without speculation"; }
   else { $("tpp").textContent="—"; $("tpp_n").textContent="no passes yet"; }
 
-  renderSlots(s);
+  const live=renderSlots(s);
 
   if(prev){
     const dg=s.gen_tokens-prev.gen_tokens, dsec=s.gen_seconds-prev.gen_seconds;
@@ -457,7 +498,21 @@ async function tick(){
     const dd=s.draft_total-prev.draft_total, da=s.draft_accepted-prev.draft_accepted;
     const dsteps=s.decode_steps-prev.decode_steps, dw=s.t-prev.t;
 
-    if(dg>0){ $("tput").textContent=fmt(dg/dw);
+    // Throughput comes from the per-stream rates when /slots is available.
+    // tokens_predicted_total (dg) moves only when a request COMPLETES, so a
+    // 1,932-token reply that finished inside one 3 s window once read as
+    // 648 tok/s. The streams count tokens as they are produced.
+    if((s.slots||[]).length){
+      if(live.decoding>0 && live.haveRate){
+        $("tput").textContent=fmt(live.total);
+        $("tput_n").textContent = live.decoding+(live.decoding>1?" streams":" stream")+" decoding"
+          +(live.prefilling?(" · "+live.prefilling+" prefilling"):""); }
+      else if(live.decoding>0){ $("tput").textContent="…"; $("tput_n").textContent="settling"; }
+      else if(live.prefilling>0){ $("tput").textContent="0";
+        $("tput_n").textContent=live.prefilling+(live.prefilling>1?" streams":" stream")+" prefilling"; }
+      else { $("tput").textContent="0"; $("tput_n").textContent="idle"; }
+    }
+    else if(dg>0){ $("tput").textContent=fmt(dg/dw);
       $("tput_n").textContent=Math.round(dg)+" tokens in "+dw.toFixed(0)+"s"; }
     else if(dsteps>0 && s.decode_steps>0){
       const tpp=s.gen_tokens/s.decode_steps;
@@ -494,9 +549,11 @@ function meterSet(el,pct,warn,bad){el.style.width=Math.max(0,Math.min(100,pct))+
 // Per-slot rates need their own history: n_decoded restarts whenever a slot
 // takes a new request, so a delta is only valid while id_task is unchanged.
 const slotHist=new Map();
+// Returns {decoding, prefilling, total, haveRate} so the Throughput card can
+// use the same per-stream rates instead of the completion-based counter.
 function renderSlots(s){
   const rows=[], slots=(s.slots||[]).filter(x=>x.busy);
-  let total=0, haveRate=false;
+  let total=0, haveRate=false, decoding=0, prefilling=0;
   for(const sl of slots){
     const h=slotHist.get(sl.id);
     // Also require the phase to be unchanged. A window that straddles the
@@ -510,6 +567,7 @@ function renderSlots(s){
     // Reporting "0 tok/s" there would be a lie; its prompt is growing, and
     // that growth rate IS its prefill speed.
     const phase = sl.decoded>0 ? "decode" : "prefill";
+    if(phase==="decode") decoding++; else prefilling++;
     let rate=null;
     if(same){
       rate = phase==="decode" ? (sl.decoded-h.decoded)/(s.t-h.t)
@@ -535,10 +593,11 @@ function renderSlots(s){
 
   const box=document.getElementById("slots");
   const note=document.getElementById("slots_n");
+  const out={decoding,prefilling,total,haveRate};
   if(!rows.length){
     box.innerHTML='<div class="quiet">no stream is generating</div>';
     note.textContent = (s.slots||[]).length ? ((s.slots||[]).length+" slots idle") : "";
-    return;
+    return out;
   }
   note.textContent = rows.length+" of "+(s.slots||[]).length+" slots busy";
   box.innerHTML="<table><thead><tr>"
@@ -552,6 +611,7 @@ function renderSlots(s){
          +`<td class="rate">${total.toFixed(1)}</td><td colspan="4"></td></tr></tfoot>`
        : "")
     +"</table>";
+  return out;
 }
 tick(); setInterval(tick,3000);
 </script>

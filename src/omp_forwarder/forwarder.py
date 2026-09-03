@@ -63,7 +63,84 @@ _upstream: int | None = None
 #: silent -- which is exactly how a real template bug went unnoticed.
 _stats: dict = {"conns": 0, "requests": 0, "2xx": 0, "4xx": 0, "5xx": 0,
                 "fallbacks": 0, "latency": [], "model": "",
+                "tok_prompt": 0, "tok_gen": 0,
                 "started": time.time()}
+
+#: The /metrics sample the token tally was last folded from, as
+#: (port, prompt_tokens_total, tokens_predicted_total). See _tally_tokens.
+_tok_last: tuple[int, float, float] | None = None
+_tok_lock = threading.Lock()
+#: Set when a relayed request completes; the sampler thread waits on it.
+_tok_dirty = threading.Event()
+
+#: Per-day token totals, so the figure survives restarts and can be compared
+#: with a paid API's daily usage. {"YYYY-MM-DD": {"prompt": n, "gen": n}},
+#: persisted to TOKENS_FILE (beside the log). Guarded by _tok_lock.
+TOKENS_FILE: str | None = None
+_day_totals: dict = {}
+_days_dirty = False
+_last_day: str | None = None
+
+
+def _today() -> str:
+    """Local date. A function so tests can move the clock."""
+    return time.strftime("%Y-%m-%d")
+
+
+def _default_tokens_file() -> str:
+    log_path = os.environ.get("OMP_FORWARDER_LOG")
+    if log_path:
+        base = os.path.dirname(log_path)
+    elif os.name == "nt":
+        base = os.path.join(os.environ.get("LOCALAPPDATA")
+                            or os.path.expanduser("~"), "omp-forwarder")
+    else:
+        base = os.path.join(os.path.expanduser("~"), ".omp-forwarder")
+    return os.path.join(base, "tokens.json")
+
+
+def _load_days() -> None:
+    global _day_totals
+    if not TOKENS_FILE:
+        return
+    try:
+        with open(TOKENS_FILE, encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, ValueError):
+        return                      # first run, or unreadable: start empty
+    if isinstance(raw, dict):
+        _day_totals = {d: {"prompt": int(v.get("prompt", 0)),
+                           "gen": int(v.get("gen", 0))}
+                       for d, v in raw.items() if isinstance(v, dict)}
+
+
+def _save_days() -> None:
+    global _days_dirty
+    if not TOKENS_FILE:
+        return
+    with _tok_lock:
+        data = json.dumps(_day_totals, indent=1, sort_keys=True)
+        _days_dirty = False
+    try:
+        os.makedirs(os.path.dirname(TOKENS_FILE), exist_ok=True)
+        tmp = TOKENS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            fh.write(data)
+        os.replace(tmp, TOKENS_FILE)       # never leave a half-written file
+    except OSError as exc:
+        log(f"cannot write {TOKENS_FILE}: {exc!r}")
+
+
+def _today_tokens() -> tuple[int, int]:
+    with _tok_lock:
+        d = _day_totals.get(_today(), {})
+        return d.get("prompt", 0), d.get("gen", 0)
+
+
+def _log_day(day: str, suffix: str = "") -> None:
+    d = _day_totals.get(day, {})
+    log(f"tokens {day}{suffix}: {d.get('prompt', 0):,} prompt, "
+        f"{d.get('gen', 0):,} generated")
 
 
 def log(msg: str) -> None:
@@ -145,6 +222,83 @@ def discover(force: bool = False) -> int | None:
             log("no healthy llama-server found")
         _upstream = None
         return None
+
+
+def _tally_tokens(port: int | None, metrics: dict,
+                  baseline: bool = False) -> None:
+    """Fold one /metrics sample into the forwarder's own token tally.
+
+    Why the forwarder keeps a tally at all: every llama-server counter is
+    cumulative since THAT PROCESS started, and Studio starts a new process on
+    every model reload. So a total read straight from /metrics covers only the
+    current process, and a dashboard baseline taken before a reload reads
+    garbage afterwards. The forwarder outlives reloads. It differences
+    successive samples and adds the deltas up.
+
+    A port it has not seen, or a counter that went backwards on the same port,
+    means a new process. Everything that process has counted happened on our
+    watch, so it goes in whole. baseline=True records the sample without
+    adding, for the server that was already running when we started: its
+    earlier work was not ours.
+
+    What it misses: tokens the OLD process produced after the last sample and
+    before it died. The sampler runs a couple of seconds after requests
+    complete, so that window is small. What it does not distinguish: this is
+    everything llama-server counted while we were running, so requests from
+    Studio's own UI or another client land in it too. Only body parsing could
+    separate them, and the relay must not parse bodies."""
+    global _tok_last, _last_day, _days_dirty
+    if not port or not metrics:
+        return
+    prompt = metrics.get("llamacpp:prompt_tokens_total", 0.0)
+    gen = metrics.get("llamacpp:tokens_predicted_total", 0.0)
+    with _tok_lock:
+        last = _tok_last
+        _tok_last = (port, prompt, gen)
+        if baseline:
+            return
+        if (last is None or last[0] != port
+                or prompt < last[1] or gen < last[2]):
+            last = (port, 0.0, 0.0)
+        dp, dg = int(prompt - last[1]), int(gen - last[2])
+        _stats["tok_prompt"] += dp
+        _stats["tok_gen"] += dg
+        # Per-day book-keeping. The finished day is logged at the first
+        # sample of the next one, which is the earliest moment we know it
+        # is over.
+        day = _today()
+        if _last_day and day != _last_day:
+            _log_day(_last_day)
+        _last_day = day
+        if dp or dg:
+            t = _day_totals.setdefault(day, {"prompt": 0, "gen": 0})
+            t["prompt"] += dp
+            t["gen"] += dg
+            _days_dirty = True
+
+
+def _sample_tokens(baseline: bool = False) -> None:
+    from . import stats as stats_mod
+    port = _upstream
+    _tally_tokens(port, stats_mod.upstream_metrics(port), baseline)
+
+
+def _token_sampler() -> None:
+    """Sample shortly after requests complete, so the tally stays current
+    with the dashboard closed and a reload loses at most a few seconds.
+
+    Also persists the per-day totals, at most every 30 s and within 30 s of
+    the last change: the wait has a timeout so a burst that ends is still
+    written even if no further request ever arrives."""
+    last_save = 0.0
+    while True:
+        if _tok_dirty.wait(timeout=30):
+            time.sleep(2)
+            _tok_dirty.clear()
+            _sample_tokens()
+        if _days_dirty and time.time() - last_save >= 30:
+            _save_days()
+            last_save = time.time()
 
 
 def _note_status(chunk: bytes) -> None:
@@ -291,6 +445,7 @@ def handle(client: socket.socket) -> None:
     t.start()
     _pump(client, up)
     t.join()
+    _tok_dirty.set()
     lat = _stats["latency"]
     lat.append(time.time() - started)
     del lat[:-200]
@@ -309,6 +464,11 @@ def _serve_forever(srv: socket.socket) -> None:
             log("stopping")
             return
         except OSError as exc:
+            # A closed listener raises on every accept, so without this the
+            # loop would spin and log forever. The tests close it to stop us;
+            # in production nothing closes it.
+            if srv.fileno() == -1:
+                return
             log(f"accept failed: {exc!r}")
             continue
         threading.Thread(target=handle, args=(client,), daemon=True).start()
@@ -334,11 +494,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "Use it for other llama-server instances you run.")
     p.add_argument("--tray", action="store_true",
                    help="show a Windows tray icon (needs pywin32)")
+    p.add_argument("--tokens-file", default=None, metavar="PATH",
+                   help="where per-day token totals are kept (default: "
+                        "tokens.json beside the log, or in "
+                        "%%LOCALAPPDATA%%\\omp-forwarder)")
     return p.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
+    global TOKENS_FILE, _last_day
     args = _parse_args(argv)
     LISTEN_PORT = args.port
     STUDIO_PORT = args.studio_port
@@ -346,6 +511,9 @@ def main(argv: list[str] | None = None) -> int:
     # Never forward to ourselves or to the proxy we exist to bypass.
     EXCLUDE_PORTS = {LISTEN_PORT, STUDIO_PORT} | set(args.exclude_port)
     _stats["started"] = time.time()
+    TOKENS_FILE = args.tokens_file or _default_tokens_file()
+    _load_days()
+    _last_day = _today()
 
     tray = None
     if args.tray:
@@ -371,6 +539,12 @@ def main(argv: list[str] | None = None) -> int:
     if os.name != "nt" and not FORCED_UPSTREAM:
         log("WARNING: auto-discovery is Windows-only; pass --upstream-port")
     log(f"initial upstream: {discover(force=True)}")
+    # Whatever that server counted before now was not our traffic.
+    _sample_tokens(baseline=True)
+    threading.Thread(target=_token_sampler, daemon=True).start()
+    log(f"token totals in {TOKENS_FILE}")
+    if any(_today_tokens()):
+        _log_day(_today(), " so far, from earlier runs")
 
     if tray is not None:
         # Win32 needs its message pump on the thread that created the window,
@@ -378,6 +552,11 @@ def main(argv: list[str] | None = None) -> int:
         threading.Thread(target=_serve_forever, args=(srv,),
                          daemon=True).start()
         tray.run()
-        return 0
-    _serve_forever(srv)
+    else:
+        _serve_forever(srv)
+    # Clean exit (tray Exit, or Ctrl-C): flush the day file and say where
+    # today stands, so the log alone answers "how much did I use today".
+    _sample_tokens()
+    _save_days()
+    _log_day(_today(), " at exit")
     return 0

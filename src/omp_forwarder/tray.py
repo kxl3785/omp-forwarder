@@ -49,10 +49,18 @@ class Tray:
         self._stop = threading.Event()
 
     # ---- tooltip reflects live state, so hovering answers "is it working?"
+    def _tokens(self) -> str:
+        """The forwarder's own tally since it started: what went to the local
+        model instead of a paid one. See forwarder._tally_tokens."""
+        st = getattr(self.fwd, "_stats", {})
+        return (f"{st.get('tok_prompt', 0):,} prompt / "
+                f"{st.get('tok_gen', 0):,} generated tokens")
+
     def _tip(self) -> str:
         up = getattr(self.fwd, "_upstream", None)
         where = f"-> 127.0.0.1:{up}" if up else "-> Studio :8888 (no direct server)"
         return (f"omp forwarder :{self.fwd.LISTEN_PORT}  {where}"
+                f"\n{self._tokens()}"
                 "\nClick for stats")[:127]
 
     def stats_url(self) -> str:
@@ -92,6 +100,8 @@ class Tray:
         win32gui.AppendMenu(menu, win32con.MF_STRING | win32con.MF_GRAYED,
                             _ID_STATUS,
                             f"upstream: {up if up else 'none (using Studio)'}")
+        win32gui.AppendMenu(menu, win32con.MF_STRING | win32con.MF_GRAYED,
+                            _ID_STATUS, self._tokens())
         win32gui.AppendMenu(menu, win32con.MF_SEPARATOR, 0, "")
         # Bold, and first: it is what a left-click does, so the menu should
         # say so rather than hide the primary action among the maintenance ones.
