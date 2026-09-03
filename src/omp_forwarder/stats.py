@@ -198,6 +198,9 @@ PAGE = r"""<!doctype html>
   --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
+/* Reserve the scrollbar even when the page is short, so switching
+   between the two pages cannot shift the layout sideways. */
+html{scrollbar-gutter:stable}
 body{margin:0;background:var(--bg);color:var(--ink);
   font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",system-ui,sans-serif;
   padding:26px 24px 40px;-webkit-font-smoothing:antialiased}
@@ -214,13 +217,16 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .bv{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px}
-/* Two pages, one nav. The usage page is a click away rather than a URL you
-   have to remember. */
-.tabs{display:flex;gap:8px;margin:15px 0 0}
-.tabs a{color:var(--dim);text-decoration:none;font-size:12.5px;padding:6px 14px;
-  border:1px solid var(--line);border-radius:8px;background:var(--panel2)}
-.tabs a:hover{color:var(--ink);border-color:#2a4a58}
-.tabs a.on{color:var(--teal);border-color:var(--teal);background:var(--panel)}
+/* Two pages, one nav. It rides on the title line and both pages carry an
+   identical header, so switching moves nothing on screen but the highlight. */
+.head{display:flex;align-items:center;justify-content:space-between;gap:18px}
+.tabs{display:flex;border:1px solid var(--line);border-radius:8px;
+  overflow:hidden;background:var(--panel2);flex:none}
+.tabs a{color:var(--dim);text-decoration:none;font-size:12px;padding:6px 15px;
+  line-height:1.5}
+.tabs a+a{border-left:1px solid var(--line)}
+.tabs a:hover{color:var(--ink)}
+.tabs a.on{color:var(--teal);background:var(--panel)}
 .on{background:var(--green);box-shadow:0 0 0 3px rgba(92,201,140,.16)}
 .off{background:var(--red);box-shadow:0 0 0 3px rgba(226,104,95,.16)}
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
@@ -285,6 +291,7 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
   </symbol>
 </svg>
 <div class="wrap">
+<div class="head">
 <h1>
 <svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
   <rect x="1.3" y="1.3" width="21.4" height="21.4" rx="5.8" fill="#0f1e26" stroke="#1d3440"/>
@@ -292,8 +299,9 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
         stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
 omp forwarder</h1>
+<nav class="tabs"><a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a></nav>
+</div>
 <div class="sub">Traffic omp sends straight to llama-server &mdash; the requests Unsloth&rsquo;s own API panel cannot see.</div>
-<div class="tabs"><a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a></div>
 
 <div class="bar">
   <div class="bit"><span class="bk">Listening</span><span class="bv" id="listen">&mdash;</span></div>

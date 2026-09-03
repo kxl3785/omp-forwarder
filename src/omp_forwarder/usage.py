@@ -34,22 +34,35 @@ PAGE = r"""<!doctype html>
   --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5
-  ui-sans-serif,"Segoe UI",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
-.wrap{max-width:880px;margin:0 auto;padding:26px 22px 60px}
-h1{font-size:19px;margin:0 0 3px;font-weight:600}
+/* Reserve the scrollbar even when the page is short, so switching
+   between the two pages cannot shift the layout sideways. */
+html{scrollbar-gutter:stable}
+/* Body padding and wrap width match the live dashboard exactly. They used to
+   differ, and switching pages then slid the whole layout sideways. */
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",system-ui,sans-serif;
+  padding:26px 24px 40px;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1060px;margin:0 auto}
+/* Deliberately identical to the live dashboard's header: same title, same
+   mark, same switch in the same place. Switching pages then moves nothing on
+   screen except which tab is lit. */
+h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
+  display:flex;align-items:center;gap:11px}
+.mark{width:22px;height:22px;flex:none}
+.head{display:flex;align-items:center;justify-content:space-between;gap:18px}
+.tabs{display:flex;border:1px solid var(--line);border-radius:8px;
+  overflow:hidden;background:var(--panel2);flex:none}
+.tabs a{color:var(--dim);text-decoration:none;font-size:12px;padding:6px 15px;
+  line-height:1.5}
+.tabs a+a{border-left:1px solid var(--line)}
+.tabs a:hover{color:var(--ink)}
+.tabs a.on{color:var(--teal);background:var(--panel)}
 h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);
   font-weight:600;margin:30px 0 12px;display:flex;align-items:center;gap:12px}
 h2 .rule{flex:1;height:1px;background:var(--line)}
 h2 .note{color:var(--dim);font-weight:400;letter-spacing:0;text-transform:none;font-size:11.5px}
-.sub{color:var(--dim);font-size:12.5px;margin:0 0 15px}
-/* Same nav as the live dashboard, so the two pages read as one thing. */
-.tabs{display:flex;gap:8px;margin:0 0 24px}
-.tabs a{color:var(--dim);text-decoration:none;font-size:12.5px;padding:6px 14px;
-  border:1px solid var(--line);border-radius:8px;background:var(--panel2)}
-.tabs a:hover{color:var(--ink);border-color:#2a4a58}
-.tabs a.on{color:var(--teal);border-color:var(--teal);background:var(--panel)}
-.grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.sub{margin:5px 0 20px;color:var(--dim);font-size:13px}
+.grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:13px 15px 14px}
 .k{font-size:9.5px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
@@ -96,9 +109,17 @@ tr.na td{color:var(--dim)}
 body.stale .wrap{opacity:.45;transition:opacity .3s}
 </style>
 <div class="wrap">
-<h1>omp forwarder &mdash; usage</h1>
-<p class="sub">What the local model did instead of a paid API.</p>
-<div class="tabs"><a href="/__stats">Live</a><a class="on" href="/__usage">Usage</a></div>
+<div class="head">
+<h1>
+<svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+  <rect x="1.3" y="1.3" width="21.4" height="21.4" rx="5.8" fill="#0f1e26" stroke="#1d3440"/>
+  <path d="M5.6 12h12.2M13.3 7.8L18.1 12l-4.8 4.2" fill="none" stroke="#5ed6cb"
+        stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+omp forwarder</h1>
+<nav class="tabs"><a href="/__stats">Live</a><a class="on" href="/__usage">Usage</a></nav>
+</div>
+<div class="sub">What the local model did instead of a paid API &mdash; the tokens you did not buy.</div>
 
 <h2>Today<span class="rule"></span><span class="note" id="day"></span></h2>
 <div class="grid">

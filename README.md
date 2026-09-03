@@ -132,7 +132,7 @@ completely silent.
 **Throughput** sums the per-stream decode rates rather than differencing
 `tokens_predicted_total`, which only moves when a request *completes* — a
 1,932-token reply landing inside one 3-second poll once read as 648 tok/s.
-In the screenshot above it reads 189.1 tok/s, matching the per-stream
+In the screenshot above it reads 134.2 tok/s, matching the per-stream
 aggregate of two concurrent requests rather than spiking off a completion.
 
 Every `llama-server` counter is cumulative since the server started, which is
@@ -162,8 +162,10 @@ decode rate would produce a number that means nothing.
 ## The usage page
 
 `http://127.0.0.1:8890/__usage` answers a different question: how much work
-went to the local model instead of a paid API. Both pages carry a **Live /
-Usage** switch, and the tray menu opens either one.
+went to the local model instead of a paid API. Both pages carry the same
+**Live / Usage** switch on the title line, over an identical header and page
+width, so switching moves nothing on screen but the highlight. The tray menu
+opens either one.
 
 ![The usage page at /__usage](assets/usage.png)
 
