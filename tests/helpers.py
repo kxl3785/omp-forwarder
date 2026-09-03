@@ -215,6 +215,13 @@ class RelayCase(ForwarderCase):
         self.thread.start()
 
     def tearDown(self):
+        # shutdown() first: on Linux close() alone does not wake a blocked
+        # accept(), so _serve_forever would never see the closed socket.
+        # Windows raises ENOTCONN on shutdown of a listener, hence the guard.
+        try:
+            self.srv.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self.srv.close()
         self.thread.join(2)
         self.assertFalse(self.thread.is_alive(),

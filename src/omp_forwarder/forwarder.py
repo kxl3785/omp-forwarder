@@ -466,10 +466,15 @@ def _serve_forever(srv: socket.socket) -> None:
         except OSError as exc:
             # A closed listener raises on every accept, so without this the
             # loop would spin and log forever. The tests close it to stop us;
-            # in production nothing closes it.
+            # in production nothing closes it. On Linux a blocked accept() is
+            # woken by shutdown(), not by close(), so the tests call shutdown
+            # first and there is a moment where the socket is shut but not yet
+            # closed: the pause below covers it, and also keeps a persistent
+            # accept failure (EMFILE, say) from becoming a hot loop.
             if srv.fileno() == -1:
                 return
             log(f"accept failed: {exc!r}")
+            time.sleep(0.1)
             continue
         threading.Thread(target=handle, args=(client,), daemon=True).start()
 
