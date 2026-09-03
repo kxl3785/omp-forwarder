@@ -14,7 +14,13 @@ src/omp_forwarder/
   make_icon.py   generates assets/omp-forwarder.ico. Pure stdlib, no Pillow.
 assets/          the .ico, and the README screenshot
 run_forwarder.bat  pythonw launcher, puts src/ on PYTHONPATH so a clone works
+tests/           unittest suite; see Testing below
+bench/           Studio-vs-forwarder measurements behind the README numbers
 ```
+
+`bench/` needs Studio's API key. It comes from `STUDIO_API_KEY_FILE`, set in
+`.claude/settings.local.json` (gitignored) so the scripts can run without the
+key ever passing through a command line or a transcript. Never cat that file.
 
 Run it without installing:
 
@@ -50,11 +56,24 @@ miscount. That is the right trade for a relay.
   forever. Dump `/metrics` and check before trusting any metric name.
 - **`tokens_predicted_total` only moves when a request COMPLETES.** Use
   `n_decode_total` for anything live, or the page reads "idle" through a long
-  generation while a request is plainly in flight.
+  generation while a request is plainly in flight. It also makes a rate
+  bursty: a 1,932-token reply finishing inside one 3 s poll read as 648
+  tok/s. The Throughput card therefore sums the per-stream decode rates from
+  `/slots` and falls back to this counter only when `/slots` is unavailable.
 - **Per-stream data comes from `/slots`, not `/metrics`.** The counter is
   `next_token[0].n_decoded`.
 - **`/metrics` has no error counter.** That is the whole reason the forwarder
   counts status codes itself.
+- **A full unified KV pool halves decode speed for everyone.** Studio uses
+  `--kv-unified`; a pass attends over the whole occupied pool. Measured
+  2026-09-03: 64 tok/s with ~100k tokens of idle agent context in the pool,
+  131-135 tok/s with the slots erased, same request. Before you blame the
+  model, the proxy, or the GPU, check what the idle slots hold
+  (`/slots` `n_prompt_tokens`). `bench/kv_pool.py` is the test.
+- **Every counter restarts at zero on a model reload**, because a reload is a
+  new process. That is why the token total is the forwarder's own tally
+  (`_tally_tokens`), not a `/metrics` read. A port change or a counter going
+  backwards means a new process, and its counters are added whole.
 
 ## Two rate bugs already fixed — do not reintroduce them
 
@@ -69,8 +88,24 @@ into the aggregate; adding a prefill rate to a decode rate means nothing.
 
 ## Testing
 
-There is no test suite yet. That is the most obvious gap. Until there is,
-verify by hand and say what you actually ran:
+```bash
+python -m unittest            # from the repo root; ~20 s, no dependencies
+```
+
+`tests/__init__.py` puts `src/` on `sys.path`, so a clone works with nothing
+installed. Nothing in the suite talks to a real llama-server: `tests/helpers.py`
+has `FakeUpstream`, a TCP server that speaks just enough HTTP to stand in for
+one, and `RelayCase`, which starts the relay on a free port. Discovery tests
+replace `tasklist` and `netstat` with recorded output, so they run on any OS.
+
+**The tests share the forwarder's module-level state** and reset it in
+`setUp`. They must run sequentially. unittest does; do not add a parallel
+runner. `_serve_forever` returns when its listener is closed only so the tests
+can stop it.
+
+Not covered: the tray, `make_icon`, the dashboard's JavaScript, and anything
+that needs a live llama-server (real `/metrics` names, real `/slots` shapes).
+For those, verify by hand and say what you actually ran:
 
 ```bash
 PYTHONPATH=src python -m omp_forwarder --port 8891     # starts, discovers

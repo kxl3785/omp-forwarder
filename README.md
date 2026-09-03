@@ -20,6 +20,39 @@ prompt, `llama.cpp` with MTP speculative decoding:
 | short request, median of 10 | 0.302 s | **0.136 s** |
 | 400-token generation | 109 tok/s | **127 tok/s** |
 
+Re-measured 2026-09-03 with a 27B reasoning model, 8-token replies, the two
+paths interleaved so both saw the same machine state: 531 ms via Studio, 335 ms
+direct, median of 10. Different model, same ratio. Streamed generation on that
+model was 48.4 tok/s via Studio and 50.1 direct, median of 3, which is within
+run-to-run noise. At 50 tok/s the proxy's per-token cost is a small fraction of
+each token; the table's 109 vs 127 was measured on a model fast enough for it to
+matter. The latency gain does not depend on model speed.
+
+**Why that day's model ran at 50 tok/s, and a warning for anyone with long
+agent contexts.** Studio starts `llama-server` with `--kv-unified`, one KV
+pool shared by all slots. In that mode a decode pass attends over the whole
+occupied pool, not only over its own tokens. Three idle slots were holding
+about 100,000 tokens of cached agent context, and a short unrelated request
+ran at 64 tok/s, 25 passes per second. With those slots saved and erased, the
+same request ran at 131 to 135 tok/s, 52 passes per second. Restoring the
+slots brought it back down. `bench/kv_pool.py` reproduces this. The
+forwarder's **Largest context** card is the early sign: when it is large and
+the server is idle, that context is still in the pool.
+
+Reproduce it with the scripts in `bench/`. Studio's port needs its API key;
+give it as `STUDIO_API_KEY`, or point `STUDIO_API_KEY_FILE` at a file that
+holds it. The key is read inside the script and never printed.
+
+```bash
+python bench/latency.py       # short request, median round trip
+python bench/throughput.py    # streamed 400-token generation, decode tok/s
+python bench/kv_pool.py       # decode speed with the KV pool full vs empty
+```
+
+`kv_pool.py` saves and erases every idle slot, then restores them. Run it only
+when nothing else is using the server. It leaves its `bench-kv-pool-slot*.bin`
+files in llama-server's `--slot-save-path` directory; delete them afterwards.
+
 An agent loop makes many small calls, so the per-call latency and the
 per-token cost both compound.
 
@@ -61,6 +94,12 @@ Or with no install at all:
 
 ```bash
 PYTHONPATH=src python -m omp_forwarder
+```
+
+The tests need nothing installed and no running `llama-server`:
+
+```bash
+python -m unittest
 ```
 
 ## Use
@@ -118,6 +157,24 @@ buying nothing), in-flight and queued requests, largest context seen, and the
 forwarder's own request count, median round trip, and **HTTP 4xx/5xx counts**.
 That last one matters: `llama-server`'s `/metrics` has no error counter, so a
 500 from a chat template is otherwise completely silent.
+
+**Total tokens** is the forwarder's own tally of prompt and generated tokens.
+It exists because every `llama-server` counter restarts at zero when Studio
+reloads a model, so a total read straight from `/metrics` only ever covers the
+current process. The forwarder outlives reloads: it folds successive
+`/metrics` samples into one running total, and a reload loses at most the few
+seconds since the last sample. With Session on it counts from when you
+clicked, which makes it a per-task or per-day figure for how much work went to
+the local model instead of a paid one. It is a count of what `llama-server`
+did while the forwarder was running, so requests from Studio's own UI or from
+another client land in it too.
+
+Per-day totals survive restarts. They live in `tokens.json` beside the log
+(`%LOCALAPPDATA%\omp-forwarder\` with `run_forwarder.bat`; `--tokens-file`
+overrides), written within 30 seconds of a change and at exit. The log gets one
+line per finished day, at the first request of the next day, plus today's
+running figure at start and at exit. The card shows today's total when it
+differs from the since-start count, which means the forwarder restarted today.
 
 ### Per stream
 
