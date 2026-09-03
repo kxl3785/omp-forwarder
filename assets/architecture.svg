@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 560" width="900" height="560" font-family="ui-sans-serif,Segoe UI,Helvetica,Arial,sans-serif">
+<title>Where omp-forwarder sits</title>
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#5ed6cb"/>
+  </marker>
+  <marker id="b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#7f9ba7"/>
+  </marker>
+  <marker id="c" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#f0b25e"/>
+  </marker>
+</defs>
+<style>
+  .bg{fill:#0b141a}
+  .panel{fill:#101e26;stroke:#1d3440;stroke-width:1.5;rx:12}
+  .ours{fill:#0d1a21;stroke:#5ed6cb;stroke-width:2}
+  .t{fill:#dcecf1;font-size:15px;font-weight:600}
+  .s{fill:#7f9ba7;font-size:12px}
+  .p{fill:#5ed6cb;font-size:12px;font-family:ui-monospace,Consolas,monospace}
+  .lbl{fill:#dcecf1;font-size:11.5px}
+  .dim{fill:#7f9ba7;font-size:11.5px}
+  .amber{fill:#f0b25e;font-size:11.5px}
+  .fast{stroke:#5ed6cb;stroke-width:2.5;fill:none}
+  .slow{stroke:#7f9ba7;stroke-width:1.5;fill:none;stroke-dasharray:5 4}
+  .fall{stroke:#f0b25e;stroke-width:1.5;fill:none;stroke-dasharray:2 4}
+  .box{fill:none;stroke:#1d3440;stroke-width:1;stroke-dasharray:4 4;rx:14}
+</style>
+
+<rect class="bg" x="0" y="0" width="900" height="560"/>
+<text class="t" x="30" y="34" font-size="17">omp-forwarder — a fixed port in front of a moving one</text>
+<text class="s" x="30" y="54">Everything below runs on one machine, on loopback only.</text>
+
+<rect class="box" x="20" y="72" width="860" height="410"/>
+<text class="dim" x="34" y="92">127.0.0.1 — nothing here is reachable from the network</text>
+
+<!-- clients -->
+<rect class="panel" x="42" y="150" width="170" height="86"/>
+<text class="t" x="60" y="180">Your client</text>
+<text class="s" x="60" y="200">omp, an editor, any</text>
+<text class="s" x="60" y="216">OpenAI-compatible tool</text>
+
+<!-- forwarder -->
+<rect class="ours" x="300" y="132" width="200" height="122" rx="12"/>
+<text class="t" x="320" y="162">omp-forwarder</text>
+<text class="p" x="320" y="182">127.0.0.1:8890</text>
+<text class="s" x="320" y="204">raw TCP relay</text>
+<text class="s" x="320" y="220">reads only the request line</text>
+<text class="s" x="320" y="236">never parses a body</text>
+
+<!-- llama-server -->
+<rect class="panel" x="640" y="132" width="200" height="122"/>
+<text class="t" x="660" y="162">llama-server</text>
+<text class="p" x="660" y="182">127.0.0.1:55084</text>
+<text class="s" x="660" y="204">the process doing the work</text>
+<text class="amber" x="660" y="222" font-size="11.5">port re-rolls on</text>
+<text class="amber" x="660" y="238" font-size="11.5">every model reload</text>
+
+<!-- studio -->
+<rect class="panel" x="640" y="330" width="200" height="106"/>
+<text class="t" x="660" y="360">Unsloth Studio</text>
+<text class="p" x="660" y="380">127.0.0.1:8888</text>
+<text class="s" x="660" y="402">Python proxy + model</text>
+<text class="s" x="660" y="418">management, needs a key</text>
+
+<!-- dashboard -->
+<rect class="panel" x="300" y="330" width="200" height="106"/>
+<text class="t" x="320" y="360">Dashboard</text>
+<text class="p" x="320" y="380">/__stats</text>
+<text class="s" x="320" y="402">served by the forwarder</text>
+<text class="s" x="320" y="418">itself, never relayed</text>
+
+<!-- client -> forwarder -->
+<path class="fast" d="M212,186 L296,186" marker-end="url(#a)"/>
+<text class="lbl" x="216" y="176">one fixed port</text>
+
+<!-- forwarder -> llama-server -->
+<path class="fast" d="M504,186 L636,186" marker-end="url(#a)"/>
+<text class="lbl" x="516" y="176">fast path</text>
+<text class="dim" x="516" y="212">246 ms short request</text>
+
+<!-- studio -> llama-server (studio's own proxy path) -->
+<path class="slow" d="M740,326 L740,258" marker-end="url(#b)"/>
+<text class="dim" x="752" y="296">Studio relays here too</text>
+
+<!-- client -> studio, the slow alternative -->
+<path class="slow" d="M127,240 L127,462 L860,462 L860,440" marker-end="url(#b)"/>
+<text class="dim" x="150" y="456">the path this replaces — 384 ms for the same request, and Studio stops showing you the traffic once you leave it</text>
+
+<!-- forwarder -> studio fallback -->
+<path class="fall" d="M400,258 L400,300 L560,300 L560,360 L636,360" marker-end="url(#c)"/>
+<text class="amber" x="410" y="292">fallback: no model loaded</text>
+
+<!-- discovery -->
+<path class="fall" d="M470,132 L470,116 L740,116 L740,128" marker-end="url(#c)"/>
+<text class="amber" x="478" y="110">discovery: tasklist + netstat + GET /health, re-run on a failed connect</text>
+
+<!-- legend -->
+<text class="t" x="30" y="516" font-size="13">What it buys you</text>
+<text class="dim" x="30" y="536">A port that never moves · 36% lower per-call latency · 8% faster streaming · a dashboard for the traffic Studio can no longer see</text>
+</svg>

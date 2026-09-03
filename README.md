@@ -68,6 +68,8 @@ morning. No client can hold a direct endpoint.
 Listens on one port that never changes, finds Studio's current `llama-server`,
 and relays raw TCP.
 
+![Where the forwarder sits](assets/architecture.svg)
+
 - **Raw TCP, not HTTP.** SSE streaming, keep-alive and chunked bodies pass
   through untouched. It reads only each request's first line, to route it.
 - **Lazy re-discovery.** When a connect fails it re-scans, so a model reload
