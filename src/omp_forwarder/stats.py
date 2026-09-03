@@ -214,6 +214,13 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .bv{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px}
+/* Two pages, one nav. The usage page is a click away rather than a URL you
+   have to remember. */
+.tabs{display:flex;gap:8px;margin:15px 0 0}
+.tabs a{color:var(--dim);text-decoration:none;font-size:12.5px;padding:6px 14px;
+  border:1px solid var(--line);border-radius:8px;background:var(--panel2)}
+.tabs a:hover{color:var(--ink);border-color:#2a4a58}
+.tabs a.on{color:var(--teal);border-color:var(--teal);background:var(--panel)}
 .on{background:var(--green);box-shadow:0 0 0 3px rgba(92,201,140,.16)}
 .off{background:var(--red);box-shadow:0 0 0 3px rgba(226,104,95,.16)}
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
@@ -286,6 +293,7 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
 </svg>
 omp forwarder</h1>
 <div class="sub">Traffic omp sends straight to llama-server &mdash; the requests Unsloth&rsquo;s own API panel cannot see.</div>
+<div class="tabs"><a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a></div>
 
 <div class="bar">
   <div class="bit"><span class="bk">Listening</span><span class="bv" id="listen">&mdash;</span></div>

@@ -42,9 +42,13 @@ h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim)
   font-weight:600;margin:30px 0 12px;display:flex;align-items:center;gap:12px}
 h2 .rule{flex:1;height:1px;background:var(--line)}
 h2 .note{color:var(--dim);font-weight:400;letter-spacing:0;text-transform:none;font-size:11.5px}
-.sub{color:var(--dim);font-size:12.5px;margin:0 0 22px}
-.sub a{color:var(--teal);text-decoration:none;border-bottom:1px solid #2a4a58}
-.sub a:hover{border-bottom-color:var(--teal)}
+.sub{color:var(--dim);font-size:12.5px;margin:0 0 15px}
+/* Same nav as the live dashboard, so the two pages read as one thing. */
+.tabs{display:flex;gap:8px;margin:0 0 24px}
+.tabs a{color:var(--dim);text-decoration:none;font-size:12.5px;padding:6px 14px;
+  border:1px solid var(--line);border-radius:8px;background:var(--panel2)}
+.tabs a:hover{color:var(--ink);border-color:#2a4a58}
+.tabs a.on{color:var(--teal);border-color:var(--teal);background:var(--panel)}
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:13px 15px 14px}
@@ -93,8 +97,8 @@ body.stale .wrap{opacity:.45;transition:opacity .3s}
 </style>
 <div class="wrap">
 <h1>omp forwarder &mdash; usage</h1>
-<p class="sub">What the local model did instead of a paid API.
-  <a href="/__stats">live dashboard &rarr;</a></p>
+<p class="sub">What the local model did instead of a paid API.</p>
+<div class="tabs"><a href="/__stats">Live</a><a class="on" href="/__usage">Usage</a></div>
 
 <h2>Today<span class="rule"></span><span class="note" id="day"></span></h2>
 <div class="grid">

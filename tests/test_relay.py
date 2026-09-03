@@ -151,6 +151,20 @@ class RelayTests(RelayCase):
         self.assertEqual(fwd._stats["requests"], 0)
         self.assertEqual(fwd._stats["conns"], 1)
 
+    def test_favicon_is_answered_locally_and_closes_the_connection(self):
+        # Not cosmetic. The relay routes only the first request on a
+        # connection, so a relayed /favicon.ico used to drag the page's own
+        # /__stats.json fetch upstream on the same keep-alive connection --
+        # a 404, and a dashboard of zeros on first load.
+        up = self.fake()
+        fwd.FORCED_UPSTREAM = up.port
+        out = raw_request(self.port, [b"GET /favicon.ico HTTP/1.1\r\n"
+                                      b"Host: 127.0.0.1\r\n\r\n"])
+        self.assertTrue(out.startswith(b"HTTP/1.1 204 No Content"))
+        self.assertIn(b"Connection: close", out)
+        self.assertEqual(up.received, [])
+        self.assertEqual(fwd._stats["requests"], 0)
+
     def test_usage_page_is_served_locally(self):
         up = self.fake()
         fwd.FORCED_UPSTREAM = up.port

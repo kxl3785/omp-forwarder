@@ -24,6 +24,7 @@ _ID_REDISCOVER = 1024
 _ID_LOG = 1025
 _ID_EXIT = 1026
 _ID_STATS = 1027
+_ID_USAGE = 1028
 _MSG_TRAY = win32con.WM_USER + 20
 
 
@@ -66,13 +67,22 @@ class Tray:
     def stats_url(self) -> str:
         return f"http://127.0.0.1:{self.fwd.LISTEN_PORT}/__stats"
 
-    def open_stats(self) -> None:
-        """Open the stats page in the default browser. startfile, not
-        webbrowser: the latter can spawn a console window under pythonw."""
+    def usage_url(self) -> str:
+        return f"http://127.0.0.1:{self.fwd.LISTEN_PORT}/__usage"
+
+    def _open(self, url: str) -> None:
+        """startfile, not webbrowser: the latter can spawn a console window
+        under pythonw."""
         try:
-            os.startfile(self.stats_url())          # noqa: S606 - user action
+            os.startfile(url)                       # noqa: S606 - user action
         except Exception:
             pass
+
+    def open_stats(self) -> None:
+        self._open(self.stats_url())
+
+    def open_usage(self) -> None:
+        self._open(self.usage_url())
 
     def _add(self) -> None:
         try:
@@ -107,6 +117,7 @@ class Tray:
         # say so rather than hide the primary action among the maintenance ones.
         win32gui.AppendMenu(menu, win32con.MF_STRING | win32con.MF_DEFAULT,
                             _ID_STATS, "Open stats")
+        win32gui.AppendMenu(menu, win32con.MF_STRING, _ID_USAGE, "Open usage")
         win32gui.AppendMenu(menu, win32con.MF_STRING, _ID_REDISCOVER,
                             "Re-discover llama-server")
         if self.log_path:
@@ -123,6 +134,8 @@ class Tray:
     def _on_command(self, cid: int) -> None:
         if cid == _ID_STATS:
             self.open_stats()
+        elif cid == _ID_USAGE:
+            self.open_usage()
         elif cid == _ID_REDISCOVER:
             self.fwd.discover(force=True)
             self.refresh()

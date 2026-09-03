@@ -391,17 +391,33 @@ def _read_request_head(client: socket.socket) -> bytes:
 
 
 #: Paths the forwarder answers itself instead of relaying.
-LOCAL_PREFIXES = ("/__stats", "/__usage")
+#:
+#: /favicon.ico is here for a reason that is not cosmetic. The relay routes
+#: only the FIRST request on a connection; anything pipelined after it follows
+#: wherever that first one went. A browser opening the dashboard asks for
+#: /favicon.ico first, that got relayed upstream, and the page's own
+#: /__stats.json fetch then reused the same keep-alive connection and reached
+#: llama-server instead -- a 404, and a page of zeros on first load. Answering
+#: it here, with Connection: close, keeps the JSON on a fresh connection.
+LOCAL_PREFIXES = ("/__stats", "/__usage", "/favicon.ico")
 
 
 def _serve_local(client: socket.socket, path: str) -> None:
-    """Serve the live dashboard (/__stats), the usage page (/__usage), and
-    the JSON both of them poll (/__stats.json)."""
+    """Serve the live dashboard (/__stats), the usage page (/__usage), the
+    JSON both of them poll (/__stats.json), and /favicon.ico."""
     from . import stats as stats_mod
     # sys.modules[__name__] rather than importing this module by name: under
     # some entry points that would build a SECOND module object with its own
     # _upstream, which then reads as None while the real one is serving.
     me = sys.modules[__name__]
+    if path.startswith("/favicon.ico"):
+        try:
+            client.sendall(b"HTTP/1.1 204 No Content\r\n"
+                           b"Cache-Control: max-age=86400\r\n"
+                           b"Connection: close\r\n\r\n")
+        except OSError:
+            pass
+        return
     if path.startswith(("/__stats.json", "/__usage.json")):
         if not _stats.get("model"):
             _stats["model"] = stats_mod.upstream_model(_upstream)

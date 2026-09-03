@@ -13,7 +13,11 @@ src/omp_forwarder/
   usage.py       /__usage page. Polls /__stats.json; no endpoint of its own.
   tray.py        Windows tray icon (win32gui). Imported lazily, only for --tray.
   make_icon.py   generates assets/omp-forwarder.ico. Pure stdlib, no Pillow.
-assets/          the .ico, and the README screenshot
+assets/          the .ico, two README screenshots, and two hand-written SVGs
+                 (architecture, performance). Regenerate the screenshots with
+                 headless Chrome --screenshot against a running forwarder.
+                 SVGs are XML: use numeric entities or literal characters,
+                 never &mdash; and friends, or GitHub refuses to render them.
 run_forwarder.bat  pythonw launcher, puts src/ on PYTHONPATH so a clone works
 tests/           unittest suite; see Testing below
 bench/           Studio-vs-forwarder measurements behind the README numbers
@@ -46,6 +50,14 @@ deliberately no `--host`.
 points, importing this package by name while it is already running builds a
 *second* module object with its own `_upstream`. Symptom: the dashboard reports
 `upstream: null` while the relay is happily serving. Cost an hour.
+
+**Only the FIRST request on a connection is routed.** Anything pipelined
+after it follows wherever that one went. This bit once: a browser asks for
+`/favicon.ico` before the page loads, that got relayed upstream, and the
+page's own `/__stats.json` fetch reused the same keep-alive connection and
+reached `llama-server` instead — a 404 and a dashboard of zeros on first
+load. `/favicon.ico` is now answered locally with `Connection: close`. Any
+new local path needs the same treatment.
 
 **The status counter is intentionally naive.** `_note_status` inspects only
 reads that *begin* with a status line. It can undercount; it will not
