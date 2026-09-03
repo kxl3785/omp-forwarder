@@ -83,7 +83,7 @@ Any API key your client sends is passed through and ignored — `llama-server`
 started by Studio has none.
 
 `run_forwarder.bat` starts it with the tray icon and no console window, and
-works straight from a clone with no install � it puts `src\` on `PYTHONPATH`
+works straight from a clone with no install — it puts `src\` on `PYTHONPATH`
 itself. Make a desktop shortcut to that file and point the shortcut's icon at
 `assets/omp-forwarder.ico`.
 
