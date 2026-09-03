@@ -80,7 +80,7 @@
 <text class="on-amber" x="430" y="234">fallback when no model is loaded</text>
 
 <!-- client -> studio, the replaced path -->
-<path class="slow" d="M120,188 L120,420 L862,420 L862,382" marker-end="url(#grey)"/>
+<path class="slow" d="M120,188 L120,420 L790,420 L790,382" marker-end="url(#grey)"/>
 <text class="on-grey" x="132" y="414">the path this replaces — same request, 384 ms, and Studio's own panel stops counting once a client leaves it</text>
 
 <!-- footer -->
