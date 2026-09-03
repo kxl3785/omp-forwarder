@@ -70,6 +70,14 @@ miscount. That is the right trade for a relay.
   131-135 tok/s with the slots erased, same request. Before you blame the
   model, the proxy, or the GPU, check what the idle slots hold
   (`/slots` `n_prompt_tokens`). `bench/kv_pool.py` is the test.
+- **The prompt cache on a hybrid model hits only on exact extension.**
+  qwen35 has recurrent SSM layers; their state cannot roll back, and Studio
+  passes `--ctx-checkpoints 0`. So a new prompt reuses the slot only if it
+  extends the slot's full token sequence, previous reply and
+  `reasoning_content` included. An identical re-ask misses. Measured
+  2026-09-03: 43 ms vs 6,300 ms on 15k tokens. Any benchmark that fakes the
+  assistant turn measures the miss, not the loop. `bench/agent_loop.py` keeps
+  the real reply for this reason.
 - **Every counter restarts at zero on a model reload**, because a reload is a
   new process. That is why the token total is the forwarder's own tally
   (`_tally_tokens`), not a `/metrics` read. A port change or a counter going

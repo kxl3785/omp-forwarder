@@ -4,11 +4,19 @@ after turn. Studio's proxy vs the forwarder.
     python bench/agent_loop.py [--context-chars 80000] [--turns 6]
                                [--reply 120] [--studio 8888] [--forwarder 8890]
 
-Each turn appends one exchange to a shared history and sends the whole thing
-through both paths. The path that goes first alternates, because the second
-call of a turn gets a fuller prompt-cache hit than the first. Per path it
-reports the median wall time per turn, the median time to first token, and
-the decode rate. This is the number an agent user feels: the wall time.
+Each path runs its own loop: a fixed context, then several turns where the
+model's real reply, reasoning included, is appended before the next question.
+That is the only shape that hits the prompt cache on a hybrid model like
+qwen35 with context checkpoints off: the recurrent layers cannot roll back,
+so the cache is reused only when the new prompt extends the slot's exact
+token sequence. Drop the reasoning, edit history, or re-ask a finished turn
+and the whole prompt is prefilled again (measured: 43 ms vs 6,300 ms on a
+15k-token context). The paths run one after the other rather than
+interleaved, because two requests for the same prefix land on the same slot
+and the second one would need a rollback.
+
+Per path it reports the median wall time per turn, the median time to first
+token, and the decode rate. Wall time is what an agent user feels.
 
 Studio's port needs its API key. Give it as STUDIO_API_KEY, or set
 STUDIO_API_KEY_FILE to a file that holds it. The key is read inside this
@@ -52,7 +60,7 @@ def context(chars: int) -> str:
 
 
 def call(port: int, key: str, messages: list, max_tokens: int):
-    """(wall s, time to first token s, tokens streamed) for one turn."""
+    """(wall s, time to first token s, tokens streamed, reply message)."""
     body = json.dumps({"messages": messages, "max_tokens": max_tokens,
                        "temperature": 0, "stream": True}).encode()
     req = urllib.request.Request(
@@ -62,6 +70,7 @@ def call(port: int, key: str, messages: list, max_tokens: int):
     t0 = time.perf_counter()
     first = None
     n = 0
+    content, reasoning = [], []
     with urllib.request.urlopen(req, timeout=900) as r:
         for line in r:
             if not line.startswith(b"data:"):
@@ -78,7 +87,17 @@ def call(port: int, key: str, messages: list, max_tokens: int):
                 n += 1
                 if first is None:
                     first = time.perf_counter() - t0
-    return time.perf_counter() - t0, first or float("nan"), n
+            if delta.get("content"):
+                content.append(delta["content"])
+            if delta.get("reasoning_content"):
+                reasoning.append(delta["reasoning_content"])
+    # The reply goes back into history verbatim, reasoning included. Without
+    # the reasoning the next prompt diverges from the slot's tokens and the
+    # cache misses.
+    reply = {"role": "assistant", "content": "".join(content)}
+    if reasoning:
+        reply["reasoning_content"] = "".join(reasoning)
+    return time.perf_counter() - t0, first or float("nan"), n, reply
 
 
 def main() -> int:
@@ -94,9 +113,7 @@ def main() -> int:
     base = [{"role": "system", "content":
              "You maintain this module. Answer briefly.\n\n" +
              context(a.context_chars)}]
-    history: list = []
     res = {a.studio: [], a.forwarder: []}
-    # Warm: prefill the shared context once, so neither path pays for it.
     try:
         call(a.forwarder, key, base + [{"role": "user", "content": "Ready?"}], 4)
         call(a.studio, key, base + [{"role": "user", "content": "Ready?"}], 4)
@@ -107,21 +124,21 @@ def main() -> int:
             return 1
         raise
     t_loop = time.perf_counter()
-    for turn in range(a.turns):
-        user = {"role": "user", "content":
-                f"Turn {turn}: add one more handler to the module and explain "
-                f"it in two sentences."}
-        msgs = base + history + [user]
-        order = (a.studio, a.forwarder) if turn % 2 == 0 else (a.forwarder, a.studio)
-        for port in order:
-            res[port].append(call(port, key, msgs, a.reply))
-        # Same placeholder reply on both paths keeps the shared prefix identical.
-        history += [user, {"role": "assistant",
-                           "content": f"Added handler_{turn}. It validates the "
-                                      f"request and renders page_{turn}."}]
+    for port in (a.studio, a.forwarder):
+        history: list = []
+        for turn in range(a.turns):
+            user = {"role": "user", "content":
+                    f"Turn {turn}: add one more handler to the module and "
+                    f"explain it in two sentences."}
+            wall, ttft, n, reply = call(port, key, base + history + [user],
+                                        a.reply)
+            res[port].append((wall, ttft, n))
+            history += [user, reply]
     total = time.perf_counter() - t_loop
-    print(f"context ~{a.context_chars // 4:,} tokens, {a.turns} turns, "
-          f"{a.reply}-token replies, both paths: {total:.1f} s total")
+    print(f"context ~{a.context_chars // 4:,} tokens, {a.turns} turns per "
+          f"path, {a.reply}-token replies, real replies kept: {total:.1f} s "
+          f"total. Turn 0 of each path prefills the context; the rest should "
+          f"hit the cache.")
     for port, xs in res.items():
         label = "Studio   " if port == a.studio else "forwarder"
         wall = statistics.median(x[0] for x in xs)

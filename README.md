@@ -41,6 +41,25 @@ slots brought it back down. `bench/kv_pool.py` reproduces this. The
 forwarder's **Largest context** card is the early sign: when it is large and
 the server is idle, that context is still in the pool.
 
+**Why the prompt cache misses on a hybrid model, and how to keep it hitting.**
+Qwen3.5-family GGUFs (`general.architecture = qwen35`) are hybrids: recurrent
+SSM layers with full attention every fourth layer. A recurrent state can be
+extended but never rolled back, and Studio starts `llama-server` with
+`--ctx-checkpoints 0`, so there is no saved state to roll back to. The cache
+is therefore reused only when a new prompt **extends the slot's exact token
+sequence**, including the previous reply and its reasoning. Measured on a
+15k-token context: an exact extension prefilled 20 tokens in 43 ms; the same
+extension with the reasoning dropped, or the same prompt asked twice,
+prefilled everything again in about 6,300 ms. Three rules follow for any
+client: keep `reasoning_content` in the history you send back, never rewrite
+earlier turns, and do not retry a finished turn. The Studio-side fix is to
+turn context checkpoints on, at a memory cost per checkpoint per slot.
+`bench/agent_loop.py` shows the difference. With the cache hitting, a
+20k-token agent turn with a 120-token reply took 1.27 s via Studio and 1.14 s
+direct, and the first token arrived after 261 ms via Studio against 107 ms
+direct. With the cache missing, both paths took 30 s per turn and the
+forwarder could not help, because prefill dominated.
+
 Reproduce it with the scripts in `bench/`. Studio's port needs its API key;
 give it as `STUDIO_API_KEY`, or point `STUDIO_API_KEY_FILE` at a file that
 holds it. The key is read inside the script and never printed.
@@ -49,6 +68,7 @@ holds it. The key is read inside the script and never printed.
 python bench/latency.py       # short request, median round trip
 python bench/throughput.py    # streamed 400-token generation, decode tok/s
 python bench/kv_pool.py       # decode speed with the KV pool full vs empty
+python bench/agent_loop.py    # long cached context + short reply, per turn
 ```
 
 `kv_pool.py` saves and erases every idle slot, then restores them. Run it only
