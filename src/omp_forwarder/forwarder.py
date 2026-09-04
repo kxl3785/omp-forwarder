@@ -54,6 +54,13 @@ LISTEN_PORT = 8890
 STUDIO_PORT = 8888
 FORCED_UPSTREAM: int | None = None
 EXCLUDE_PORTS: set[int] = set()
+#: Seconds to wait for a llama-server to appear before giving up on a request.
+#: A model reload leaves a gap of tens of seconds; see _await_upstream.
+WAIT_FOR_MODEL = 30
+#: Relay to Studio when no llama-server is running. Off by default: Studio
+#: requires its own API key, so for a client that does not hold one the
+#: fallback returns 401 rather than an answer. See _serve_unavailable.
+STUDIO_FALLBACK = False
 
 _lock = threading.Lock()
 _upstream: int | None = None
@@ -62,7 +69,7 @@ _upstream: int | None = None
 #: error counter, so without these a 500 from the chat template is completely
 #: silent -- which is exactly how a real template bug went unnoticed.
 _stats: dict = {"conns": 0, "requests": 0, "2xx": 0, "4xx": 0, "5xx": 0,
-                "fallbacks": 0, "latency": [], "model": "",
+                "fallbacks": 0, "unavailable": 0, "latency": [], "model": "",
                 "tok_prompt": 0, "tok_cached": 0, "tok_gen": 0,
                 "started": time.time()}
 
@@ -444,6 +451,67 @@ def _serve_local(client: socket.socket, path: str) -> None:
         pass
 
 
+def _await_upstream() -> int | None:
+    """The current llama-server port, waiting up to WAIT_FOR_MODEL seconds for
+    one to appear.
+
+    A model reload leaves a window with no llama-server at all. Measured on a
+    27B model: a request arrived 7 s into the gap and the server appeared 34 s
+    later. Failing instantly there turns "the model is still loading" into an
+    error, so this polls instead. The cost is a slow first request after a
+    reload, which is the right trade: the client gets its answer."""
+    port = discover()
+    if port is not None:
+        return port
+    port = discover(force=True)
+    if port is not None or WAIT_FOR_MODEL <= 0:
+        return port
+    deadline = time.time() + WAIT_FOR_MODEL
+    log(f"no llama-server; waiting up to {WAIT_FOR_MODEL}s for one")
+    while time.time() < deadline:
+        time.sleep(1.0)
+        port = discover(force=True)
+        if port is not None:
+            log(f"llama-server appeared after "
+                f"{WAIT_FOR_MODEL - (deadline - time.time()):.0f}s")
+            return port
+    return None
+
+
+def _serve_unavailable(client: socket.socket) -> None:
+    """503 with Retry-After, in the OpenAI error shape.
+
+    WHY NOT FALL BACK TO STUDIO. Studio's API requires its own key. A client
+    pointed at this forwarder sends whatever key it likes, because
+    llama-server ignores keys entirely -- so relaying to Studio hands that
+    client a 401. That is the worst signal available: 401 means "your
+    credentials are wrong, stop trying", when the truth is "the model is
+    loading, try again shortly". It cost a real outage. A 503 with
+    Retry-After says the right thing, and every OpenAI client understands it.
+
+    --studio-fallback restores the old behaviour for a client that does hold
+    Studio's key, where the fallback really does trigger load-on-demand."""
+    body = json.dumps({"error": {
+        "message": ("No llama-server is running. Unsloth Studio is probably "
+                    "loading a model; retry shortly."),
+        "type": "service_unavailable",
+        "code": "model_not_loaded",
+    }}).encode()
+    head = "\r\n".join([
+        "HTTP/1.1 503 Service Unavailable",
+        "Content-Type: application/json",
+        f"Content-Length: {len(body)}",
+        "Retry-After: 5",
+        "Cache-Control: no-store",
+        "Connection: close",
+        "", "",
+    ]).encode()
+    try:
+        client.sendall(head + body)
+    except OSError:
+        pass
+
+
 def handle(client: socket.socket) -> None:
     _stats["conns"] += 1
     head = _read_request_head(client)
@@ -461,10 +529,16 @@ def handle(client: socket.socket) -> None:
 
     _stats["requests"] += 1
     started = time.time()
-    port = discover()
+    port = _await_upstream()
     if port is None:
-        port = discover(force=True)
-    if port is None:
+        # Nothing to relay to. Answer 503 ourselves rather than handing the
+        # client Studio's 401 -- see _serve_unavailable.
+        if not STUDIO_FALLBACK:
+            _stats["unavailable"] += 1
+            log(f"no llama-server after {WAIT_FOR_MODEL}s; returning 503")
+            _serve_unavailable(client)
+            client.close()
+            return
         log(f"no llama-server; falling back to Studio :{STUDIO_PORT}")
         port = STUDIO_PORT
     try:
@@ -548,6 +622,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    metavar="N",
                    help="never treat this port as the upstream. Repeatable. "
                         "Use it for other llama-server instances you run.")
+    p.add_argument("--wait-for-model", type=int, default=30, metavar="SECONDS",
+                   help="when no llama-server is running, wait this long for "
+                        "one to appear before failing the request. A model "
+                        "reload leaves a gap of tens of seconds. 0 disables "
+                        "the wait (default: 30)")
+    p.add_argument("--studio-fallback", action="store_true",
+                   help="relay to Studio when no llama-server is running, "
+                        "instead of answering 503. Only useful if your client "
+                        "sends Studio's API key; without it Studio returns "
+                        "401, which clients read as a fatal config error")
     p.add_argument("--tray", action="store_true",
                    help="show a Windows tray icon (needs pywin32)")
     p.add_argument("--tokens-file", default=None, metavar="PATH",
@@ -559,11 +643,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
-    global TOKENS_FILE, _last_day
+    global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
     args = _parse_args(argv)
     LISTEN_PORT = args.port
     STUDIO_PORT = args.studio_port
     FORCED_UPSTREAM = args.upstream_port
+    WAIT_FOR_MODEL = args.wait_for_model
+    STUDIO_FALLBACK = args.studio_fallback
     # Never forward to ourselves or to the proxy we exist to bypass.
     EXCLUDE_PORTS = {LISTEN_PORT, STUDIO_PORT} | set(args.exclude_port)
     _stats["started"] = time.time()

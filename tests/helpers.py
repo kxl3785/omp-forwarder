@@ -76,12 +76,16 @@ def reset_state() -> None:
     fwd._upstream = None
     fwd.FORCED_UPSTREAM = None
     fwd.EXCLUDE_PORTS = set()
+    # No test should sit in the reload wait; the ones that care set it.
+    fwd.WAIT_FOR_MODEL = 0
+    fwd.STUDIO_FALLBACK = False
     # A dead port, so a test that falls back cannot reach a real Studio.
     fwd.STUDIO_PORT = free_port()
     # clear+update rather than rebind: the module holds the dict by identity.
     fwd._stats.clear()
     fwd._stats.update({"conns": 0, "requests": 0, "2xx": 0, "4xx": 0,
-                       "5xx": 0, "fallbacks": 0, "latency": [], "model": "",
+                       "5xx": 0, "fallbacks": 0, "unavailable": 0,
+                       "latency": [], "model": "",
                        "tok_prompt": 0, "tok_cached": 0, "tok_gen": 0,
                        "started": time.time()})
     fwd._tok_last = None

@@ -267,27 +267,78 @@ class RelayTests(RelayCase):
         self.assertTrue(out.startswith(b"HTTP/1.1 200 OK"))
         self.assertEqual(fwd._upstream, up.port)
 
-    def test_falls_back_to_studio_when_no_llama_server(self):
+    def test_no_model_returns_503_not_studios_401(self):
+        # The bug this replaces: with no llama-server the request went to
+        # Studio, which requires its own API key and answered 401. A client
+        # reads 401 as "your config is wrong, stop trying" when the truth is
+        # "the model is loading". It cost a real outage.
+        studio = self.fake(lambda m, p, r: [http_response(401, b"no key")])
+        fwd.STUDIO_PORT = studio.port
+        with mock.patch.object(fwd, "_server_pids", return_value=set()):
+            out = raw_request(self.port, [REQUEST])
+        self.assertTrue(out.startswith(b"HTTP/1.1 503 Service Unavailable"))
+        self.assertIn(b"Retry-After: 5", out)
+        self.assertIn(b"model_not_loaded", out)
+        body = json.loads(out.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(body["error"]["type"], "service_unavailable")
+        # Studio was never touched, so it cannot contribute a 401.
+        self.assertEqual(studio.received, [])
+        self.assertEqual(fwd._stats["unavailable"], 1)
+        self.assertEqual(fwd._stats["fallbacks"], 0)
+        self.assertEqual(fwd._stats["4xx"], 0)
+
+    def test_studio_fallback_is_opt_in(self):
         studio = self.fake(echo_body)
         fwd.STUDIO_PORT = studio.port
+        fwd.STUDIO_FALLBACK = True
         with mock.patch.object(fwd, "_server_pids", return_value=set()):
             out = raw_request(self.port, [REQUEST])
         self.wait_done(1)
         self.assertTrue(out.startswith(b"HTTP/1.1 200 OK"))
         self.assertEqual(studio.received, [REQUEST])
         self.assertEqual(fwd._stats["fallbacks"], 1)
+        self.assertEqual(fwd._stats["unavailable"], 0)
         self.assertIsNone(fwd._upstream)
 
-    def test_closes_client_when_nothing_answers(self):
-        # No llama-server and Studio is down too: the client must see EOF,
-        # not hang until its own timeout.
+    def test_waits_for_a_model_that_appears_mid_request(self):
+        # A reload leaves a gap of tens of seconds. Failing instantly there
+        # turns "still loading" into an error.
+        up = self.fake(echo_body)
+        fwd.WAIT_FOR_MODEL = 20
+        ready = []
+
+        def pids():
+            # Absent on the first two scans, then present.
+            ready.append(1)
+            return {"1"} if len(ready) > 2 else set()
+
+        # The port lookup must honour its argument: no pids, no ports. A mock
+        # that ignored it would report a server during the gap.
+        with mock.patch.object(fwd, "_server_pids", side_effect=pids), \
+                mock.patch.object(fwd, "_listening_ports",
+                                  side_effect=lambda ps: [up.port] if ps else []):
+            t0 = time.time()
+            out = raw_request(self.port, [REQUEST], timeout=30)
+        waited = time.time() - t0
+        self.wait_done(1)
+        self.assertTrue(out.startswith(b"HTTP/1.1 200 OK"))
+        # up.received also holds the /health probes discovery made.
+        self.assertIn(REQUEST, up.received)
+        self.assertGreater(waited, 0.9, "did not actually wait")
+        self.assertLess(waited, 20, "waited past the model appearing")
+        self.assertEqual(fwd._stats["unavailable"], 0)
+
+    def test_wait_gives_up_at_the_deadline(self):
+        fwd.WAIT_FOR_MODEL = 2
         with mock.patch.object(fwd, "_server_pids", return_value=set()):
             t0 = time.time()
-            out = raw_request(self.port, [REQUEST], timeout=10)
-        self.assertLess(time.time() - t0, 8)
-        self.assertEqual(out, b"")
-        self.assertEqual(fwd._stats["requests"], 1)
-        wait_for(lambda: fwd._stats["conns"] == 1, what="conn counted")
+            out = raw_request(self.port, [REQUEST], timeout=30)
+        waited = time.time() - t0
+        self.assertTrue(out.startswith(b"HTTP/1.1 503"))
+        self.assertGreaterEqual(waited, 2)
+        self.assertLess(waited, 12)
+        self.assertEqual(fwd._stats["unavailable"], 1)
+        # A 503 we served ourselves is not a relayed round trip.
         self.assertEqual(fwd._stats["latency"], [])
 
     def test_client_that_sends_nothing_is_dropped(self):

@@ -154,6 +154,8 @@ def snapshot(fwd, stats: dict) -> dict:
         "status_5xx": stats.get("5xx", 0),
         "latency_p50_ms": round(lat[len(lat) // 2] * 1000, 1) if lat else None,
         "fallbacks": stats.get("fallbacks", 0),
+        # Requests answered 503 because no llama-server was running.
+        "unavailable": stats.get("unavailable", 0),
         # The forwarder's own tally: survives model reloads, which restart
         # every llama-server counter at zero.
         "tok_prompt": stats.get("tok_prompt", 0),
@@ -487,7 +489,9 @@ async function tick(){
     tokNote += " · today "+Math.round(today).toLocaleString();
   $("tok_n").textContent = tokNote;
   $("req").textContent=F.requests;
-  $("conn_n").textContent=F.conns+" connections"+(F.fallbacks?(" · "+F.fallbacks+" via Studio"):"");
+  $("conn_n").textContent=F.conns+" connections"
+    +(F.fallbacks?(" · "+F.fallbacks+" via Studio"):"")
+    +(F.unavailable?(" · "+F.unavailable+" no model"):"");
   $("e5").textContent=F.status_5xx; $("e4").textContent=F.status_4xx;
   $("e5").className="v "+(F.status_5xx>0?"red":"");
   const tot=F.status_2xx+F.status_4xx+F.status_5xx;

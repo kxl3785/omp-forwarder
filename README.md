@@ -40,10 +40,11 @@ and relays raw TCP.
   through untouched. It reads only each request's first line, to route it.
 - **Lazy re-discovery.** When a connect fails it re-scans, so a model reload
   costs one failed connection instead of a config edit.
-- **Falls back to Studio.** With no model loaded there is no `llama-server` to
-  reach, so it forwards to `:8888` instead. That one request pays the
-  overhead, but it triggers Studio's load-on-demand and every later request
-  goes direct.
+- **Waits out a model reload.** A reload leaves a window with no
+  `llama-server` at all — measured at 34 seconds on a 27B model. Rather than
+  failing the request, the forwarder polls for up to `--wait-for-model`
+  seconds (30 by default) and then relays. If the model never appears it
+  answers **503 with `Retry-After`**, which tells a client to try again.
 - **Loopback only, with no option to change it.** A forwarder that drops an
   API-key requirement should not be reachable off the machine.
 
@@ -103,6 +104,8 @@ itself. Make a desktop shortcut to that file and point the shortcut's icon at
 | `--studio-port N` | Studio's API port, used as the fallback (default 8888) |
 | `--upstream-port N` | skip discovery and always use this port |
 | `--exclude-port N` | never treat this port as the upstream; repeatable |
+| `--wait-for-model N` | seconds to wait for a model during a reload (default 30; 0 disables) |
+| `--studio-fallback` | relay to Studio when no model is loaded, instead of 503 |
 | `--tokens-file PATH` | where per-day token totals are kept |
 | `--tray` | Windows tray icon; needs `pywin32` |
 
@@ -302,6 +305,15 @@ the icon generator, or the two pages' JavaScript.
 - **No authentication.** It is loopback-only for that reason. Anything running
   as your user on your machine can reach the model through it — but that was
   already true of `llama-server` itself, which Studio starts with no API key.
+- **It cannot tell one `llama-server` from another.** Discovery takes the
+  highest-numbered healthy port, so a second `llama-server` you run for
+  something else can be picked up and silently answer your requests. Exclude
+  it with `--exclude-port`, and check the **Model** field on the dashboard if
+  replies ever look wrong for the model you expected.
+- **`--studio-fallback` needs Studio's API key.** Studio rejects an
+  unauthenticated request with 401, which a client reads as a fatal
+  configuration error rather than "retry shortly". That is why the fallback is
+  off by default and a 503 is returned instead.
 - **The 4xx/5xx counter can undercount.** It inspects only reads that begin
   with a status line, rather than tracking HTTP framing, because a relay that
   parsed framing could break streaming. On loopback a status line practically

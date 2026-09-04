@@ -51,6 +51,22 @@ points, importing this package by name while it is already running builds a
 *second* module object with its own `_upstream`. Symptom: the dashboard reports
 `upstream: null` while the relay is happily serving. Cost an hour.
 
+**Never relay to Studio for a client that lacks Studio's key.** Studio's API
+requires one; a client pointed here sends whatever key it likes, because
+`llama-server` ignores keys. So the old "fall back to :8888" path handed omp a
+**401**, which a client reads as "your config is wrong, stop trying" when the
+truth is "the model is loading". It cost a real outage on 2026-09-03. The
+forwarder now waits `--wait-for-model` seconds for a server to appear, then
+answers **503 with Retry-After**. `--studio-fallback` restores the old
+behaviour for a client that does hold the key.
+
+**Discovery cannot tell two `llama-server` processes apart.** It takes the
+highest healthy port. RadHelper runs its own 4B model on a llama-server, and
+excluding Studio's port made discovery silently select that one — a 4B
+radiology model answering coding requests, with nothing in the reply to say
+so. Its port moves (8788, then 8799), so a hard-coded `--exclude-port` goes
+stale. Check the dashboard's Model field when a reply looks wrong.
+
 **Only the FIRST request on a connection is routed.** Anything pipelined
 after it follows wherever that one went. This bit once: a browser asks for
 `/favicon.ico` before the page loads, that got relayed upstream, and the
