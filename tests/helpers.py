@@ -79,6 +79,9 @@ def reset_state() -> None:
     # No test should sit in the reload wait; the ones that care set it.
     fwd.WAIT_FOR_MODEL = 0
     fwd.STUDIO_FALLBACK = False
+    fwd.UPSTREAM_EXE = None
+    fwd._upstream_exe = None
+    fwd._port_owner = {}
     # A dead port, so a test that falls back cannot reach a real Studio.
     fwd.STUDIO_PORT = free_port()
     # clear+update rather than rebind: the module holds the dict by identity.

@@ -104,6 +104,7 @@ itself. Make a desktop shortcut to that file and point the shortcut's icon at
 | `--studio-port N` | Studio's API port, used as the fallback (default 8888) |
 | `--upstream-port N` | skip discovery and always use this port |
 | `--exclude-port N` | never treat this port as the upstream; repeatable |
+| `--upstream-exe S` | only use a `llama-server` whose executable path contains `S` |
 | `--wait-for-model N` | seconds to wait for a model during a reload (default 30; 0 disables) |
 | `--studio-fallback` | relay to Studio when no model is loaded, instead of 503 |
 | `--tokens-file PATH` | where per-day token totals are kept |
@@ -275,10 +276,37 @@ is to turn context checkpoints on, at a memory cost per checkpoint per slot.
 ## How discovery works
 
 1. List `llama-server` processes (`tasklist`).
-2. Find their listening TCP ports (`netstat -ano`), highest first, skipping
+2. If `--upstream-exe` is set, keep only those whose executable path contains
+   it.
+3. Find their listening TCP ports (`netstat -ano`), highest first, skipping
    the forwarder's own port, Studio's port, and anything you excluded.
-3. Take the first that answers `GET /health` with 200.
-4. Cache it. Re-scan on a failed connect, or from the tray menu.
+4. Take the first that answers `GET /health` with 200.
+5. Cache it. Re-scan on a failed connect, or from the tray menu.
+
+### If you run more than one `llama-server`
+
+Discovery cannot tell them apart by port, so the wrong model can answer with
+nothing in the reply to say so. It happened here: a second `llama-server`
+belonging to another project served a 4B model in place of the intended 27B.
+
+`--upstream-exe SUBSTRING` fixes it by keeping only servers whose executable
+path contains that substring:
+
+```bash
+omp-forwarder --upstream-exe .unsloth
+```
+
+The executable path is the right thing to match on because it is the only part
+that holds still. Ports change on every model reload, and model names change
+whenever you load a different model; an install directory does not. Reading it
+costs 0.03 ms for every `llama-server` on the machine, using `ctypes` against
+the Windows API rather than another subprocess.
+
+A process whose path cannot be read is excluded, not included: an unknown
+executable is not the one you asked for. If nothing matches you get the 503
+above, which is the right answer — better than a different model's reply. The
+chosen executable appears in `/__stats.json` as `upstream_exe`, and on the
+dashboard when you hover the **Upstream** field.
 
 ## Development
 
@@ -305,11 +333,10 @@ the icon generator, or the two pages' JavaScript.
 - **No authentication.** It is loopback-only for that reason. Anything running
   as your user on your machine can reach the model through it — but that was
   already true of `llama-server` itself, which Studio starts with no API key.
-- **It cannot tell one `llama-server` from another.** Discovery takes the
-  highest-numbered healthy port, so a second `llama-server` you run for
-  something else can be picked up and silently answer your requests. Exclude
-  it with `--exclude-port`, and check the **Model** field on the dashboard if
-  replies ever look wrong for the model you expected.
+- **Two `llama-server` processes look alike by port.** Discovery takes the
+  highest-numbered healthy one, so another `llama-server` you run for
+  something else can be picked up and answer silently. Use `--upstream-exe`,
+  below.
 - **`--studio-fallback` needs Studio's API key.** Studio rejects an
   unauthenticated request with 401, which a client reads as a fatal
   configuration error rather than "retry shortly". That is why the fallback is

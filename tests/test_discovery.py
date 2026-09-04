@@ -66,7 +66,88 @@ class ServerPidsTests(ForwarderCase):
             self.assertEqual(fwd._server_pids(), set())
 
 
+class UpstreamExeTests(ForwarderCase):
+    """--upstream-exe: keep only llama-servers from one install.
+
+    Discovery takes the highest healthy port and cannot otherwise tell two
+    llama-server processes apart, so a second one answers silently with a
+    different model. The executable path is the only stable discriminator:
+    ports move on every reload and model names move whenever you load a
+    different model."""
+
+    STUDIO = r"C:\Users\me\.unsloth\llama.cpp\build\bin\Release\llama-server.exe"
+    OTHER = r"C:\Users\me\Projects\radhelper\bin\cuda\llama-server.exe"
+
+    def _tasklist(self, stdout=TASKLIST):
+        return mock.patch.object(subprocess, "run",
+                                 return_value=_completed(stdout))
+
+    def test_unset_keeps_every_server(self):
+        with mock.patch.object(os, "name", "nt"), self._tasklist(), \
+                mock.patch.object(fwd, "_exe_path",
+                                  side_effect=AssertionError("looked up")):
+            self.assertEqual(fwd._server_pids(), {"39900", "40001"})
+
+    def test_keeps_only_matching_paths(self):
+        paths = {"39900": self.STUDIO, "40001": self.OTHER}
+        fwd.UPSTREAM_EXE = ".unsloth"
+        with mock.patch.object(os, "name", "nt"), self._tasklist(), \
+                mock.patch.object(fwd, "_exe_path", paths.get):
+            self.assertEqual(fwd._server_pids(), {"39900"})
+
+    def test_match_is_case_insensitive(self):
+        fwd.UPSTREAM_EXE = ".UNSLOTH"
+        with mock.patch.object(os, "name", "nt"), self._tasklist(), \
+                mock.patch.object(fwd, "_exe_path",
+                                  return_value=self.STUDIO):
+            self.assertEqual(fwd._server_pids(), {"39900", "40001"})
+
+    def test_an_unreadable_path_is_excluded(self):
+        # Fail closed: an unknown executable is not the one you asked for.
+        fwd.UPSTREAM_EXE = ".unsloth"
+        with mock.patch.object(os, "name", "nt"), self._tasklist(), \
+                mock.patch.object(fwd, "_exe_path", return_value=None):
+            self.assertEqual(fwd._server_pids(), set())
+
+    def test_no_match_means_no_upstream_not_the_wrong_one(self):
+        other = self.fake()          # a healthy server we must NOT choose
+        fwd.UPSTREAM_EXE = ".unsloth"
+        with mock.patch.object(fwd, "_server_pids", return_value=set()), \
+                mock.patch.object(fwd, "_listening_ports",
+                                  side_effect=lambda ps: [other.port] if ps
+                                  else []):
+            self.assertIsNone(fwd.discover(force=True))
+        self.assertIsNone(fwd._upstream)
+
+    def test_discover_records_the_chosen_executable(self):
+        up = self.fake()
+        fwd._port_owner = {up.port: "39900"}
+        with mock.patch.object(fwd, "_server_pids", return_value={"39900"}), \
+                mock.patch.object(fwd, "_listening_ports",
+                                  return_value=[up.port]), \
+                mock.patch.object(fwd, "_exe_path", return_value=self.STUDIO):
+            self.assertEqual(fwd.discover(force=True), up.port)
+        self.assertEqual(fwd._upstream_exe, self.STUDIO)
+
+    def test_exe_path_is_none_off_windows(self):
+        with mock.patch.object(os, "name", "posix"):
+            self.assertIsNone(fwd._exe_path(1234))
+
+    def test_exe_path_survives_a_bad_pid(self):
+        # Whatever happens, discovery must not die over this.
+        self.assertIsNone(fwd._exe_path(0))
+        self.assertIsNone(fwd._exe_path(2 ** 31 - 1))
+
+
 class ListeningPortsTests(ForwarderCase):
+
+    def test_records_which_pid_owns_each_port(self):
+        # discover() needs it to report the chosen server's executable.
+        with mock.patch.object(subprocess, "run",
+                               return_value=_completed(NETSTAT)):
+            fwd._listening_ports({"39900", "40001"})
+        self.assertEqual(fwd._port_owner[55084], "39900")
+        self.assertEqual(fwd._port_owner[60008], "40001")
 
     def test_listening_ports_of_the_given_pids_highest_first(self):
         with mock.patch.object(subprocess, "run",

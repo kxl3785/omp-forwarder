@@ -60,12 +60,15 @@ forwarder now waits `--wait-for-model` seconds for a server to appear, then
 answers **503 with Retry-After**. `--studio-fallback` restores the old
 behaviour for a client that does hold the key.
 
-**Discovery cannot tell two `llama-server` processes apart.** It takes the
-highest healthy port. RadHelper runs its own 4B model on a llama-server, and
-excluding Studio's port made discovery silently select that one — a 4B
+**Discovery cannot tell two `llama-server` processes apart by port.** It takes
+the highest healthy one. RadHelper runs its own 4B model on a llama-server,
+and excluding Studio's port made discovery silently select that one — a 4B
 radiology model answering coding requests, with nothing in the reply to say
 so. Its port moves (8788, then 8799), so a hard-coded `--exclude-port` goes
-stale. Check the dashboard's Model field when a reply looks wrong.
+stale. `--upstream-exe .unsloth` is the fix: it matches on the executable
+path, which is the only stable discriminator, and `_exe_path` reads it with
+`ctypes` in 0.03 ms rather than spawning PowerShell (252 ms). `wmic` is gone
+from Windows 11; do not reach for it.
 
 **Only the FIRST request on a connection is routed.** Anything pipelined
 after it follows wherever that one went. This bit once: a browser asks for

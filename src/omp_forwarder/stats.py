@@ -143,6 +143,9 @@ def snapshot(fwd, stats: dict) -> dict:
         "t": time.time(),
         "uptime_s": int(time.time() - stats.get("started", _STARTED)),
         "upstream": port,
+        # Which llama-server executable answered. Discovery cannot tell two
+        # of them apart by port, so this is how a wrong one becomes visible.
+        "upstream_exe": getattr(fwd, "_upstream_exe", None),
         "model": stats.get("model") or "-",
         "listen": getattr(fwd, "LISTEN_PORT", None),
         "live": bool(m),
@@ -465,6 +468,8 @@ async function tick(){
 
   $("listen").textContent="127.0.0.1:"+s.listen;
   $("up").textContent=s.upstream?("127.0.0.1:"+s.upstream):"Studio :8888 (fallback)";
+  // Hovering names the executable: two llama-servers look identical here.
+  $("up").title = s.upstream_exe || "";
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.live?"on":"off");
   $("state").textContent=s.live?"ready":(s.upstream?"unreachable":"no direct server");

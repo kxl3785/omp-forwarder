@@ -61,6 +61,10 @@ WAIT_FOR_MODEL = 30
 #: requires its own API key, so for a client that does not hold one the
 #: fallback returns 401 rather than an answer. See _serve_unavailable.
 STUDIO_FALLBACK = False
+#: Only consider a llama-server whose executable path contains this substring.
+#: Off by default, which keeps the old "any llama-server" behaviour. See
+#: _exe_path for why the path is the right thing to match on.
+UPSTREAM_EXE: str | None = None
 
 _lock = threading.Lock()
 _upstream: int | None = None
@@ -174,6 +178,56 @@ def log(msg: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
 
 
+def _exe_path(pid: str | int) -> str | None:
+    """The executable a PID is running, or None.
+
+    WHY THIS EXISTS. Discovery takes the highest healthy port and cannot
+    otherwise tell two llama-server processes apart. A second one -- a
+    different model, run for something else entirely -- gets picked up and
+    answers your requests, with nothing in the reply to say so. That happened
+    here: excluding Studio's port made discovery select a 4B model belonging
+    to another project.
+
+    The executable path is the only stable discriminator. Ports move on every
+    reload and model names change whenever you load a different model; an
+    install directory does not.
+
+    WHY ctypes. Reading the path costs 0.03 ms for every llama-server on the
+    box, against 252 ms to shell out to PowerShell, and it adds no dependency.
+    (`wmic` is not an option: Windows 11 has removed it.) Discovery can run on
+    a failed-connect path, so it has to stay cheap."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # PROCESS_QUERY_LIMITED_INFORMATION: enough for the image name, and
+        # unlike PROCESS_QUERY_INFORMATION it works without extra rights.
+        handle = k32.OpenProcess(0x1000, False, int(pid))
+        if not handle:
+            return None
+        try:
+            buf = ctypes.create_unicode_buffer(32768)
+            size = wintypes.DWORD(len(buf))
+            if k32.QueryFullProcessImageNameW(handle, 0, buf,
+                                              ctypes.byref(size)):
+                return buf.value
+        finally:
+            k32.CloseHandle(handle)
+    except Exception:
+        return None                 # never let discovery die over this
+    return None
+
+
+#: port -> owning PID, filled in by _listening_ports. Kept so discover() can
+#: report which executable the chosen upstream belongs to without a second
+#: netstat on every dashboard poll.
+_port_owner: dict[int, str] = {}
+#: Executable path of the current upstream, for the dashboard.
+_upstream_exe: str | None = None
+
+
 def _server_pids() -> set[str]:
     """PIDs of running llama-server processes.
 
@@ -190,7 +244,18 @@ def _server_pids() -> set[str]:
     except Exception as exc:
         log(f"tasklist failed: {exc!r}")
         return set()
-    return set(re.findall(r'"llama-server\.exe","(\d+)"', out))
+    pids = set(re.findall(r'"llama-server\.exe","(\d+)"', out))
+    if not UPSTREAM_EXE:
+        return pids
+    keep, want = set(), UPSTREAM_EXE.lower()
+    for pid in pids:
+        path = _exe_path(pid)
+        if path and want in path.lower():
+            keep.add(pid)
+        else:
+            log(f"ignoring llama-server pid {pid} ({path or 'path unknown'}): "
+                f"does not match --upstream-exe {UPSTREAM_EXE!r}")
+    return keep
 
 
 def _listening_ports(pids: set[str]) -> list[int]:
@@ -215,6 +280,7 @@ def _listening_ports(pids: set[str]) -> list[int]:
             p = int(m.group(1))
             if p not in EXCLUDE_PORTS:
                 ports.append(p)
+                _port_owner[p] = parts[-1]
     # Highest port first: Studio's random pick is always high, so a stray
     # low-numbered listener is more likely to be something else.
     return sorted(set(ports), reverse=True)
@@ -231,7 +297,7 @@ def _healthy(port: int) -> bool:
 
 def discover(force: bool = False) -> int | None:
     """The current llama-server port, cached. force=True re-scans."""
-    global _upstream
+    global _upstream, _upstream_exe
     with _lock:
         if FORCED_UPSTREAM:
             _upstream = FORCED_UPSTREAM
@@ -241,13 +307,17 @@ def discover(force: bool = False) -> int | None:
         for port in _listening_ports(_server_pids()):
             if _healthy(port):
                 if port != _upstream:
-                    log(f"upstream -> {HOST}:{port}")
+                    owner = _port_owner.get(port)
+                    _upstream_exe = _exe_path(owner) if owner else None
+                    log(f"upstream -> {HOST}:{port}"
+                        + (f" ({_upstream_exe})" if _upstream_exe else ""))
                     _stats["model"] = ""      # re-read it for the new server
                 _upstream = port
                 return port
         if _upstream is not None:
             log("no healthy llama-server found")
         _upstream = None
+        _upstream_exe = None
         return None
 
 
@@ -627,6 +697,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "one to appear before failing the request. A model "
                         "reload leaves a gap of tens of seconds. 0 disables "
                         "the wait (default: 30)")
+    p.add_argument("--upstream-exe", default=None, metavar="SUBSTRING",
+                   help="only use a llama-server whose executable path "
+                        "contains this. Use it when you run more than one: "
+                        "discovery cannot otherwise tell them apart, and the "
+                        "wrong model will answer silently. Try '.unsloth'")
     p.add_argument("--studio-fallback", action="store_true",
                    help="relay to Studio when no llama-server is running, "
                         "instead of answering 503. Only useful if your client "
@@ -644,7 +719,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
     global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
+    global UPSTREAM_EXE
     args = _parse_args(argv)
+    UPSTREAM_EXE = args.upstream_exe
     LISTEN_PORT = args.port
     STUDIO_PORT = args.studio_port
     FORCED_UPSTREAM = args.upstream_port
