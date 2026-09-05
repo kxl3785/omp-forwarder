@@ -213,7 +213,15 @@ def snapshot(fwd, stats: dict) -> dict:
     differences successive samples for live rates, and differences a stored
     baseline for session figures. Both need the raw counter."""
     port = getattr(fwd, "_upstream", None)
-    m = upstream_metrics(port)
+    # Ask a dead upstream nothing. On this Windows a connect to a closed
+    # loopback port times out instead of being refused, so an unloaded
+    # lane paid ~4 s per poll here, and a peer's 2 s read of this snapshot
+    # never succeeded: the Lanes panel showed every unloaded lane as
+    # unreachable. The sampler's /health verdict gates both readers once it
+    # has run; before its first pass (and in the tests) nothing changes.
+    live = (not getattr(fwd, "_health_sampled", False)
+            or getattr(fwd, "_upstream_healthy", False))
+    m = upstream_metrics(port) if live else {}
     # The page's poll doubles as a sample for the token tally, so the Tokens
     # card is live while the dashboard is open. See forwarder._tally_tokens.
     tally = getattr(fwd, "_tally_tokens", None)
@@ -224,7 +232,7 @@ def snapshot(fwd, stats: dict) -> dict:
     days_fn = getattr(fwd, "recent_days", None)
     lat = sorted(list(stats.get("latency", ()))[-200:])
     g = m.get
-    slots = upstream_slots(port)
+    slots = upstream_slots(port) if live else []
     # The keepalive child's pid when container mode is on, else None.
     _ka = getattr(fwd, "_container_keepalive", None)
     keepalive_pid = _ka.pid if _ka is not None else None
@@ -405,6 +413,20 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .peers .pdot.on{background:var(--green)}
 .peers .pdot.off{background:var(--red)}
 .peers .pfx{color:var(--dim);font-size:10px}
+/* Lanes panel: one row per card, this lane first. */
+.lanes{display:flex;flex-direction:column;gap:6px;margin-bottom:22px}
+.lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1.5fr) minmax(0,2fr) auto minmax(80px,auto);
+  gap:14px;align-items:center;padding:10px 14px;background:var(--panel);border:1px solid var(--line);
+  border-radius:8px;font-family:var(--mono);font-size:12px}
+.lane.self{border-color:var(--teal)}
+.lane .ln b{color:var(--ink);font-weight:600}
+.lane .ln a{color:var(--teal);text-decoration:none}
+.lane .ln a:hover{text-decoration:underline}
+.lane .lg{color:var(--dim)}
+.lane .lp.ok{color:var(--green)} .lane .lp.warn{color:var(--amber)} .lane .lp.dim{color:var(--dim)} .lane .lp.bad{color:var(--red)}
+.lane .lm{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lane .ctl{justify-content:flex-end}
+@media (max-width:900px){.lane{grid-template-columns:1fr 1fr;} .lane .lm{display:none}}
 /* GPU panel: one row per card, the matching lane marked. */
 .gpus{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   overflow:hidden}
@@ -586,6 +608,9 @@ __HEADER__
   <button class="rst" id="rst-all" title="Reset every section to start from now">
     <svg><use href="#ico-rst"/></svg>Reset all</button>
 </div>
+
+<h2>Lanes<span class="rule"></span></h2>
+<div class="lanes" id="lanes"></div>
 
 <h2>Deployment<span class="rule"></span></h2>
 <div class="facts" id="facts">
@@ -1017,6 +1042,42 @@ async function tick(){
   }
   setF("f_spec", F2.speculative==="none"?"none":(F2.speculative||"unknown"));
   setF("f_par", F2.parallel);
+  // Lanes: this lane first, then every --peer, one row per card with the
+  // same buttons. A peer's button posts to THIS forwarder with lane=<port>;
+  // the forwarder relays it with the peer's token, which never reaches the
+  // page. Rows are rebuilt only when the set of lanes or presets changes,
+  // so a click never lands on a freshly re-rendered button.
+  const esc=t=>String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+  const lanesEl=$("lanes");
+  const me={port:String(location.port||"80"),name:s.name,gpu:s.gpu,preset:s.preset,loading:s.loading,
+    operator_stopped:s.operator_stopped,healthy:s.healthy,model:s.model,presets:s.presets||[],reachable:true,self:true};
+  const lanes=[me].concat((s.peers||[]).map(pp=>Object.assign({},pp,{port:String(pp.port)})));
+  const lkey=lanes.map(l=>l.port+":"+(l.presets||[]).join(",")).join("|");
+  if(lanesEl.dataset.built!==lkey){
+    lanesEl.innerHTML=lanes.map(l=>{
+      const ln=l.self?"":' data-lane="'+esc(l.port)+'"';
+      const btns=(l.presets||[]).map(p=>'<button data-act="assign" data-preset="'+esc(p)+'"'+ln+'>'+esc(p)+'</button>').join("")
+        +'<button data-act="stop" class="danger"'+ln+'>unload</button>';
+      return '<div class="lane'+(l.self?" self":"")+'" data-port="'+esc(l.port)+'"><span class="ln"></span><span class="lg"></span>'
+        +'<span class="lp"></span><span class="lm"></span><span class="ctl">'+btns+'</span><span class="ctl_msg"></span></div>';
+    }).join("");
+    lanesEl.dataset.built=lkey; wireCtl(lanesEl);
+  }
+  lanes.forEach(l=>{
+    const row=lanesEl.querySelector('.lane[data-port="'+l.port+'"]'); if(!row) return;
+    const nm=esc(l.name||("lane :"+l.port));
+    row.querySelector(".ln").innerHTML=(l.self?"<b>"+nm+"</b> <span class=\"pfx\">this page</span>"
+      :'<a href="http://127.0.0.1:'+esc(l.port)+'/__stats">'+nm+'</a>')+' <span class="pfx">:'+esc(l.port)+'</span>';
+    row.querySelector(".lg").textContent=(l.gpu===null||l.gpu===undefined)?"no gpu":("GPU "+l.gpu);
+    const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"unhealthy"))):"none assigned");
+    const lp=row.querySelector(".lp"); lp.textContent=(l.preset||"\u2014")+" \u00b7 "+st;
+    lp.className="lp "+(st==="serving"?"ok":(st==="loading\u2026"?"warn":(st==="unreachable"||st==="unhealthy"?"bad":"dim")));
+    row.querySelector(".lm").textContent=l.model||"";
+    row.querySelectorAll("button").forEach(b=>{
+      b.disabled=!!l.loading||!l.reachable;
+      if(b.dataset.act==="assign") b.classList.toggle("on", b.dataset.preset===l.preset && !l.operator_stopped && !!l.healthy);
+    });
+  });
   // Model presets: one button per recipe the operator may put on this GPU,
   // plus unload. Buttons are built once from the preset list and only
   // their disabled state changes afterwards, so a click never lands on a
@@ -1147,13 +1208,15 @@ function wireCtl(root){
       const act=btn.dataset.act, preset=btn.dataset.preset;
       // Scope the disable and the message to this group: the Container bit,
       // the Upstream-process bit and the Model row each carry their own.
-      const grp=btn.closest(".bit")||btn.closest(".row"), msg=grp.querySelector(".ctl_msg");
-      const q=act==="assign"?("assign "+preset+" to this GPU? Whatever it fronts now is unloaded first."):(act+" the upstream? This frees its GPU.");
+      const lane=btn.dataset.lane;
+      const grp=btn.closest(".bit")||btn.closest(".row")||btn.closest(".lane"), msg=grp.querySelector(".ctl_msg");
+      const where=lane?("lane :"+lane):"this GPU";
+      const q=act==="assign"?("assign "+preset+" to "+where+"? Whatever it fronts now is unloaded first."):(act+" the upstream on "+where+"? This frees its GPU.");
       if(act!=="start" && !confirm(q)) return;
       grp.querySelectorAll("button").forEach(b=>b.disabled=true);
       try{
         const r=await fetch("/__control?token="+encodeURIComponent(_ctrlToken)
-          +"&action="+act+(preset?("&preset="+encodeURIComponent(preset)):""),{method:"POST",cache:"no-store"});
+          +"&action="+act+(preset?("&preset="+encodeURIComponent(preset)):"")+(lane?("&lane="+encodeURIComponent(lane)):""),{method:"POST",cache:"no-store"});
         const j=await r.json();
         msg.textContent=j.status?("-> "+j.status+(j.port?(" on :"+j.port):"")):(j.error||"");
       }catch(e){ msg.textContent="request failed"; }

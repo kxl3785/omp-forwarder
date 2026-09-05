@@ -1,0 +1,161 @@
+"""One page drives every lane. A peer's preset state rides along in
+_peer_state for the Lanes panel; its control token goes to _peer_tokens and
+never into the snapshot. `lane=<peer port>` on /__control relays the action
+to that peer with the peer's own token, server-side, loopback only."""
+from __future__ import annotations
+
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
+
+from omp_forwarder import forwarder as fwd
+from omp_forwarder import stats
+
+from .helpers import ForwarderCase, RelayCase, raw_request
+
+
+def _body(out: bytes) -> dict:
+    return json.loads(out.split(b"\r\n\r\n", 1)[1])
+
+
+PEER_SNAPSHOT = {
+    "name": "GPU 1", "healthy": True, "gpu": 1, "facts": {"engine": "sglang"},
+    "preset": "sglang-nothink", "loading": False, "operator_stopped": False,
+    "presets": ["llama-tune", "sglang-nothink"], "model": "qwen",
+    "control_token": "peer-secret",
+}
+
+
+class PeerStateTests(ForwarderCase):
+
+    def test_preset_state_is_kept_and_token_is_not_published(self):
+        fwd.PEERS = [8891]
+        fwd.LISTEN_PORT = 8892
+        with mock.patch.object(stats, "_http_get_json", return_value=dict(PEER_SNAPSHOT)):
+            fwd._sample_peers()
+        p = fwd._peer_state[8891]
+        self.assertEqual((p["preset"], p["loading"], p["operator_stopped"]),
+                         ("sglang-nothink", False, False))
+        self.assertEqual(p["presets"], ["llama-tune", "sglang-nothink"])
+        self.assertNotIn("control_token", p)
+        self.assertEqual(fwd._peer_tokens[8891], "peer-secret")
+        snap = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertNotIn("peer-secret", json.dumps(snap))
+
+
+class LaneRelayTests(RelayCase):
+
+    def setUp(self):
+        super().setUp()
+        fwd._control_token = "tok"
+        fwd.PEERS = [8891]
+        fwd._peer_tokens = {8891: "peer-secret"}
+        fwd._presets = {"llama-tune": {"kind": "process", "port": 1, "cmd": "x"}}
+
+    def _post(self, q: str) -> bytes:
+        return raw_request(self.port, [f"POST /__control?{q} HTTP/1.1\r\n\r\n".encode()])
+
+    def test_relays_with_the_peer_token(self):
+        seen = []
+        with mock.patch.object(fwd, "_peer_control",
+                               side_effect=lambda port, token, action, preset, timeout=90.0:
+                               seen.append((port, token, action, preset)) or
+                               (200, {"ok": True, "status": "loading", "port": 49501})):
+            out = self._post("token=tok&lane=8891&action=assign&preset=llama-tune")
+        self.assertTrue(out.startswith(b"HTTP/1.1 200"), out[:80])
+        self.assertEqual(seen, [(8891, "peer-secret", "assign", "llama-tune")])
+        b = _body(out)
+        self.assertEqual((b["status"], b["lane"]), ("loading", 8891))
+
+    def test_peer_status_passes_through(self):
+        with mock.patch.object(fwd, "_peer_control",
+                               return_value=(409, {"ok": False, "error": "no-gpu"})):
+            out = self._post("token=tok&lane=8891&action=assign&preset=llama-tune")
+        self.assertTrue(out.startswith(b"HTTP/1.1 409"), out[:80])
+
+    def test_unknown_lane_is_400(self):
+        out = self._post("token=tok&lane=9999&action=stop")
+        self.assertTrue(out.startswith(b"HTTP/1.1 400"), out[:80])
+        self.assertEqual(_body(out)["lanes"], [8891])
+
+    def test_peer_token_not_yet_read_is_503(self):
+        fwd._peer_tokens = {}
+        out = self._post("token=tok&lane=8891&action=stop")
+        self.assertTrue(out.startswith(b"HTTP/1.1 503"), out[:80])
+
+    def test_local_token_still_gates_the_relay(self):
+        out = self._post("token=wrong&lane=8891&action=stop")
+        self.assertTrue(out.startswith(b"HTTP/1.1 403"), out[:80])
+
+    def test_get_with_lane_never_relays(self):
+        with mock.patch.object(fwd, "_peer_control") as pc:
+            out = raw_request(self.port, [b"GET /__control?token=tok&lane=8891&action=stop HTTP/1.1\r\n\r\n"])
+        self.assertTrue(out.startswith(b"HTTP/1.1 405"), out[:80])
+        pc.assert_not_called()
+
+    def test_own_port_as_lane_acts_locally(self):
+        fwd.PEERS = [8891, self.port]
+        fwd.FWD_GPU = None
+        with mock.patch.object(fwd, "_peer_control") as pc:
+            out = self._post(f"token=tok&lane={self.port}&action=assign&preset=llama-tune")
+        pc.assert_not_called()
+        self.assertTrue(out.startswith(b"HTTP/1.1 409"), out[:80])  # no --gpu, local answer
+
+
+class PeerControlHttpTests(ForwarderCase):
+    """The one real HTTP call, against a tiny loopback server."""
+
+    def test_posts_query_and_parses_json(self):
+        seen = []
+
+        class H(BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append(self.path)
+                body = json.dumps({"ok": True, "status": "stopped"}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        code, body = fwd._peer_control(srv.server_address[1], "t0k", "stop", "", timeout=5)
+        self.assertEqual((code, body["status"]), (200, "stopped"))
+        self.assertEqual(seen, ["/__control?token=t0k&action=stop"])
+
+    def test_dead_peer_is_502(self):
+        from .helpers import free_port
+        code, body = fwd._peer_control(free_port(), "t", "stop", "", timeout=2)
+        self.assertEqual(code, 502)
+        self.assertFalse(body["ok"])
+
+
+class DeadUpstreamSnapshotTests(ForwarderCase):
+    """An unloaded lane must answer /__stats.json at once. A connect to a
+    closed loopback port can take the full timeout on Windows, and the
+    snapshot used to pay it twice per poll."""
+
+    def test_readers_skipped_once_sampler_says_unhealthy(self):
+        fwd._upstream = 49501
+        fwd._health_sampled = True
+        fwd._upstream_healthy = False
+        with mock.patch.object(stats, "upstream_metrics") as m:
+            with mock.patch.object(stats, "upstream_slots") as sl:
+                stats.snapshot(fwd, dict(fwd._stats))
+        m.assert_not_called()
+        sl.assert_not_called()
+
+    def test_readers_run_before_the_first_sample_and_when_healthy(self):
+        fwd._upstream = 49501
+        for sampled, healthy in ((False, False), (True, True)):
+            fwd._health_sampled, fwd._upstream_healthy = sampled, healthy
+            with mock.patch.object(stats, "upstream_metrics", return_value={}) as m:
+                with mock.patch.object(stats, "upstream_slots", return_value=[]):
+                    stats.snapshot(fwd, dict(fwd._stats))
+            m.assert_called_once()

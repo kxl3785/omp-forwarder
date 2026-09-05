@@ -118,6 +118,8 @@ def reset_state() -> None:
     fwd.FWD_GPU = None
     # Per-peer and GPU sampler state.
     fwd._peer_state = {}
+    fwd._peer_tokens = {}
+    fwd._health_sampled = False
     fwd._gpu_state = []
     # Unload control: the start command and the operator's stop latch.
     fwd.UPSTREAM_CMD = None

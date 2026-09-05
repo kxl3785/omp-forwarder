@@ -104,6 +104,14 @@ _preset: str | None = None
 #: starts without --container and later assigns a container preset needs it
 #: started on demand, or the dashboard reads "unknown" for a running container.
 _container_monitor_started: bool = False
+#: Each --peer forwarder's /__control token, read from its /__stats.json by
+#: the sampler. Kept out of _peer_state on purpose: the snapshot copies that
+#: dict to the page, and a page must never hold another lane's token. The
+#: relay in _serve_control is the only reader.
+_peer_tokens: dict = {}
+#: True once _sample_health has run. stats.snapshot skips the /metrics and
+#: /slots readers when the sampler has a verdict and it is "unhealthy".
+_health_sampled: bool = False
 
 
 def _ensure_container_monitor() -> None:
@@ -456,7 +464,8 @@ def _sample_health() -> None:
     "live = /metrics sample succeeded" light read a healthy serving upstream
     as red "unreachable". /health is the endpoint every engine behind this
     forwarder actually implements."""
-    global _upstream_healthy
+    global _upstream_healthy, _health_sampled
+    _health_sampled = True
     port = _upstream
     if port is None:
         _upstream_healthy = False
@@ -492,7 +501,11 @@ def _sample_peers() -> None:
     for port in PEERS:
         if port == LISTEN_PORT:
             continue  # a forwarder never lists itself
-        d = stats_mod._http_get_json(port, "/__stats.json", timeout=2)
+        # 5 s, not 2: a peer's first snapshot after ITS start is slow until
+        # its own sampler has run once (see stats.snapshot on dead ports),
+        # and a 2 s read missed it, so the Lanes panel said "unreachable"
+        # and the relay answered "peer not read yet" for the first minute.
+        d = stats_mod._http_get_json(port, "/__stats.json", timeout=5)
         if isinstance(d, dict):
             facts = d.get("facts") or {}
             _peer_state[port] = {
@@ -503,7 +516,16 @@ def _sample_peers() -> None:
                 "thinking": facts.get("thinking", "unknown"),
                 "gpu": d.get("gpu"),
                 "reachable": True,
+                # Preset state for the Lanes panel, so one page can show and
+                # drive every card. No token here: see _peer_tokens.
+                "preset": d.get("preset"),
+                "loading": bool(d.get("loading")),
+                "operator_stopped": bool(d.get("operator_stopped")),
+                "presets": list(d.get("presets") or []),
+                "model": d.get("model") or "",
             }
+            if d.get("control_token"):
+                _peer_tokens[port] = d["control_token"]
             seen.add(port)
         else:
             # Dead port: keep the last shape but say the read failed. The
@@ -1259,6 +1281,35 @@ def _control_action(action: str, timeout: float = 30.0) -> str:
     return status
 
 
+_RELAY_STATUS = {200: "200 OK", 400: "400 Bad Request", 403: "403 Forbidden",
+                 404: "404 Not Found", 405: "405 Method Not Allowed",
+                 409: "409 Conflict", 503: "503 Service Unavailable"}
+
+
+def _peer_control(port: int, token: str, action: str, preset: str,
+                  timeout: float = 90.0) -> tuple[int, dict]:
+    """POST one control action to a peer forwarder and return (status, body).
+    The lane relay's one network call; tests replace it. 90 s because a
+    container stop or an assign can take that long on the far side."""
+    import http.client
+    q = urllib.parse.urlencode({"token": token, "action": action,
+                                **({"preset": preset} if preset else {})})
+    conn = http.client.HTTPConnection(HOST, port, timeout=timeout)
+    try:
+        conn.request("POST", "/__control?" + q)
+        resp = conn.getresponse()
+        raw = resp.read()
+        try:
+            body = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            body = {"ok": False, "error": raw[:200].decode("utf-8", "replace")}
+        return resp.status, body
+    except OSError as exc:
+        return 502, {"ok": False, "error": f"peer unreachable: {exc!r}"}
+    finally:
+        conn.close()
+
+
 def _serve_control(client: socket.socket, path: str, method: str) -> None:
     """POST /__control?token=<T>&action=<start|stop|restart>.
     Routes on the first line's method and query string only; the body is
@@ -1309,6 +1360,32 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
         return
     if token != _control_token:
         reply("403 Forbidden", {"ok": False, "error": "bad token"})
+        return
+    lane = (params.get("lane") or [""])[0]
+    if lane and lane != str(LISTEN_PORT):
+        # Drive another lane from this page. Gated by THIS lane's token,
+        # limited to ports named in --peer (never an open proxy), and the
+        # peer's own token is supplied here, server-side: the page never
+        # holds it, which is what keeps the no-CORS design intact.
+        try:
+            lane_port = int(lane)
+        except ValueError:
+            lane_port = -1
+        if lane_port not in PEERS:
+            reply("400 Bad Request", {"ok": False, "error": "unknown lane",
+                                      "lanes": sorted(PEERS)})
+            return
+        peer_token = _peer_tokens.get(lane_port)
+        if not peer_token:
+            reply("503 Service Unavailable",
+                  {"ok": False, "lane": lane_port,
+                   "error": "peer not read yet; try again in 10 s"})
+            return
+        code, body = _peer_control(lane_port, peer_token, action,
+                                   (params.get("preset") or [""])[0])
+        body = dict(body) if isinstance(body, dict) else {"ok": False}
+        body["lane"] = lane_port
+        reply(_RELAY_STATUS.get(code, "502 Bad Gateway"), body)
         return
     if action == "assign":
         preset = (params.get("preset") or [""])[0]
