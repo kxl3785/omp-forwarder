@@ -144,7 +144,7 @@ class RelayTests(RelayCase):
         body = r.read()
         self.assertEqual(r.status, 200)
         self.assertIn("text/html", r.getheader("Content-Type"))
-        self.assertIn(b"<title>omp forwarder</title>", body)
+        self.assertIn(b'<title id="pg_title">omp forwarder</title>', body)
         # Served by the forwarder itself: nothing reached the upstream, and it
         # does not count as a relayed request.
         self.assertEqual(up.received, [])

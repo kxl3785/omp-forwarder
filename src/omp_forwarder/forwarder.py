@@ -39,13 +39,15 @@ import argparse
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
-
+from typing import Callable
 HOST = "127.0.0.1"
 
 #: Set from the command line by main(). Module-level because the tray and the
@@ -63,12 +65,50 @@ WAIT_FOR_MODEL = 30
 STUDIO_FALLBACK = False
 #: Only consider a llama-server whose executable path contains this substring.
 #: Off by default, which keeps the old "any llama-server" behaviour. See
-#: _exe_path for why the path is the right thing to match on.
 UPSTREAM_EXE: str | None = None
+#: Human label for this forwarder (from --name), shown on the dashboard and
+#: in the page title. None when unset.
+FWD_NAME: str | None = None
+#: Ports of other forwarders on this machine (from --peer, repeatable).
+#: Rendered as links in the dashboard header; never probed.
+PEERS: list[int] = []
+
+#: Container-upstream mode, enabled when both --wsl-distro and --container are
+#: given. WSL_DISTRO hosts a Docker container that runs the model server;
+#: CONTAINER_NAME is that container.
+WSL_DISTRO: str | None = None
+CONTAINER_NAME: str | None = None
+#: Last observed `docker inspect -f {{.State.Status}}` result ("running",
+#: "exited", ...), or None when container mode is off. Read by the dashboard.
+_container_status: str | None = None
+#: Keepalive child so WSL2 does not tear the distro down between our
+#: commands; see _container_keepalive_start.
+_container_keepalive: subprocess.Popen | None = None
+#: Timestamp of the last auto-start attempt; the monitor retries at most
+#: once a minute so a container that keeps crashing is not hammered.
+_container_last_start: float = 0.0
 
 _lock = threading.Lock()
 _upstream: int | None = None
 
+#: Last /health result for the current upstream, refreshed by the health
+#: sampler thread; never probed on the request path. Drives the dashboard's
+#: honest "ready" light -- /health (not /metrics) is the answer SGLang gives,
+#: so a healthy upstream must not read as "unreachable" just because it has
+#: no /metrics endpoint.
+_upstream_healthy: bool = False
+#: Deployment facts the monitor thread last read from the upstream's
+#: /get_server_info or /props, refreshed every 10 s so the dashboard poll
+#: (the request path) only copies them. Shape: {engine, thinking,
+#: speculative, parallel, model_path}.
+_upstream_facts: dict = {}
+#: One random 32-hex string, generated at startup. The /__control endpoint
+#: requires it in the query string before it will mutate the container. The
+#: dashboard is loopback-only, but any web page the user visits can make the
+#: browser send requests to 127.0.0.1; a foreign page cannot read
+#: /__stats.json (no CORS headers are sent, and none must be added), so it
+#: cannot learn the token, and a GET can never mutate. See _serve_local.
+_control_token: str = ""
 #: Counters only the forwarder can produce. llama-server's /metrics has no
 #: error counter, so without these a 500 from the chat template is completely
 #: silent -- which is exactly how a real template bug went unnoticed.
@@ -176,6 +216,122 @@ def _log_day(day: str, suffix: str = "") -> None:
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%H:%M:%S')} {msg}", flush=True)
+
+
+def _run_wsl(args: list[str], timeout: float = 10.0):
+    """All container-mode subprocess calls go through this one function so
+    tests can replace it with a fake that returns recorded output."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception:
+        return None
+
+def _spawn_wsl(args: list[str]) -> subprocess.Popen:
+    """Long-lived child (the keepalive). Separate from _run_wsl because
+    Popen must not be waited on; tests replace this too."""
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
+def _poll_container_status() -> None:
+    """Read docker inspect once and remember the result in _container_status.
+    Runs on the monitor thread's timer; never on the request path."""
+    global _container_status, _container_last_start
+    if not WSL_DISTRO or not CONTAINER_NAME:
+        return
+    res = _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+                    "docker", "inspect", "-f", "{{.State.Status}}",
+                    CONTAINER_NAME],
+                   timeout=10)
+    if res is None:
+        _container_status = "error"
+        return
+    _container_status = res.stdout.strip() or "error"
+    # Auto-start once per minute: docker start on an exited container, but
+    # only when the relay has no healthy upstream, so a container that keeps
+    # crashing is not restarted in a tight loop.
+    if _container_status == "exited" and _upstream is None:
+        now = time.time()
+        if now - _container_last_start >= 60:
+            _container_last_start = now
+            _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+                      "docker", "start", CONTAINER_NAME],
+                     timeout=30)
+            log(f"container {CONTAINER_NAME} exited; ran docker start")
+
+
+def _container_keepalive_start() -> None:
+    global _container_keepalive
+    # WSL2 shuts a distro down when its last client exits, and Docker inside
+    # it then SIGTERMs every container: an upstream launched from a shell
+    # dies a few seconds after that shell closes. A resident `sleep infinity`
+    # keeps the distro alive for as long as the forwarder runs.
+    proc = _spawn_wsl(
+        ["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--", "sleep", "infinity"])
+    log(f"keepalive: wsl -d {WSL_DISTRO} pid {proc.pid}")
+    _container_keepalive = proc
+
+
+def _container_keepalive_stop() -> None:
+    global _container_keepalive
+    if _container_keepalive is not None:
+        _container_keepalive.terminate()
+        try:
+            _container_keepalive.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _container_keepalive.kill()
+        _container_keepalive = None
+        log("keepalive stopped")
+
+
+def _container_monitor() -> None:
+    """Background thread: polls container status every 10 s so the dashboard
+    shows a live state and auto-start can trigger. Never on the request path."""
+    while True:
+        time.sleep(10)
+        _poll_container_status()
+
+
+def _sample_health() -> None:
+    """Remember whether the current upstream answers /health with 200.
+    Runs on the sampler thread; never on the request path.
+
+    This is what makes the dashboard's status light honest: SGLang has no
+    /metrics (it 404s) but DOES answer /health and /v1/models, so the old
+    "live = /metrics sample succeeded" light read a healthy serving upstream
+    as red "unreachable". /health is the endpoint every engine behind this
+    forwarder actually implements."""
+    global _upstream_healthy
+    port = _upstream
+    if port is None:
+        _upstream_healthy = False
+        return
+    _upstream_healthy = _healthy(port)
+
+
+def _sample_upstream_facts() -> None:
+    """Read the deployment facts (engine, thinking, speculative, parallel,
+    model_path) from the upstream and remember them in _upstream_facts.
+    Runs on the sampler thread; the dashboard poll only copies them.
+    All HTTP goes through stats.upstream_facts, one replaceable function, so
+    the tests swap it for recorded JSON."""
+    global _upstream_facts
+    from . import stats as stats_mod
+    _upstream_facts = stats_mod.upstream_facts(_upstream)
+
+
+
+def _upstream_sampler() -> None:
+    """Background thread: probes /health and reads the deployment facts every
+    10 s so the dashboard's status light and Deployment panel are truthful
+    without paying for them on the request path. Started unconditionally,
+    alongside the token sampler, so non-container deployments get the fields
+    too."""
+    while True:
+        time.sleep(10)
+        _sample_health()
+        _sample_upstream_facts()
 
 
 def _exe_path(pid: str | int) -> str | None:
@@ -476,17 +632,91 @@ def _read_request_head(client: socket.socket) -> bytes:
 #: /__stats.json fetch then reused the same keep-alive connection and reached
 #: llama-server instead -- a 404, and a page of zeros on first load. Answering
 #: it here, with Connection: close, keeps the JSON on a fresh connection.
-LOCAL_PREFIXES = ("/__stats", "/__usage", "/favicon.ico")
+LOCAL_PREFIXES = ("/__stats", "/__usage", "/__control", "/favicon.ico")
 
 
-def _serve_local(client: socket.socket, path: str) -> None:
+
+
+def _control_action(action: str, timeout: float = 30.0) -> str:
+    """Run `docker <action> CONTAINER_NAME` in the WSL distro via the
+    _run_wsl seam, then re-read the container status once and return it.
+    Only start/stop/restart are accepted; anything else is "" so the caller
+    can reject it. Never called on the relay path: the handler runs it
+    synchronously because /__control is a local path, not the relay."""
+    if not WSL_DISTRO or not CONTAINER_NAME:
+        return "error"
+    if action not in ("start", "stop", "restart"):
+        return "error"
+    _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+              "docker", action, CONTAINER_NAME],
+             timeout=timeout)
+    _poll_container_status()
+    return _container_status or "error"
+
+
+def _serve_control(client: socket.socket, path: str, method: str) -> None:
+    """POST /__control?token=<T>&action=<start|stop|restart>.
+    Routes on the first line's method and query string only; the body is
+    never read. GET (any query) -> 405. Wrong or missing token -> 403.
+    Unknown action -> 400. Container mode off -> 404. Success -> 200 with a
+    tiny JSON body. The token is checked before anything runs, so the only
+    way to mutate the container is to hold the token, which a foreign page
+    cannot read because /__stats.json sends no CORS headers.
+    Answers with Connection: close for the same reason /__stats does: it is
+    a local path and the browser must not reuse a keep-alive connection."""
+    # Split off the query string; the path part is /__control.
+    _, _, query = path.partition("?")
+    params = urllib.parse.parse_qs(query, keep_blank_values=True)
+    token = (params.get("token") or [""])[0]
+    action = (params.get("action") or [""])[0]
+
+    def reply(status: str, body: dict) -> None:
+        raw = json.dumps(body).encode()
+        lines = [
+            f"HTTP/1.1 {status}",
+            "Content-Type: application/json",
+            f"Content-Length: {len(raw)}",
+            "Cache-Control: no-store",
+            "Connection: close",
+            "", "",
+        ]
+        try:
+            client.sendall("\r\n".join(lines).encode() + raw)
+        except OSError:
+            pass
+
+    # Container mode off: nothing to control.
+    if not (WSL_DISTRO and CONTAINER_NAME):
+        reply("404 Not Found", {"ok": False, "error": "container mode off"})
+        return
+    # Only POST mutates; a GET can never do anything.
+    if method != "POST":
+        reply("405 Method Not Allowed",
+              {"ok": False, "error": "POST only"})
+        return
+    if token != _control_token:
+        reply("403 Forbidden", {"ok": False, "error": "bad token"})
+        return
+    if action not in ("start", "stop", "restart"):
+        reply("400 Bad Request", {"ok": False, "error": "unknown action"})
+        return
+    status = _control_action(action)
+    reply("200 OK", {"ok": True, "action": action, "status": status})
+
+
+def _serve_local(client: socket.socket, path: str, method: str = "GET") -> None:
     """Serve the live dashboard (/__stats), the usage page (/__usage), the
-    JSON both of them poll (/__stats.json), and /favicon.ico."""
+    JSON both of them poll (/__stats.json), the container controls
+    (/__control), and /favicon.ico. method is the first line's verb; only
+    /__control branches on it. The body is never read or parsed."""
     from . import stats as stats_mod
     # sys.modules[__name__] rather than importing this module by name: under
     # some entry points that would build a SECOND module object with its own
     # _upstream, which then reads as None while the real one is serving.
     me = sys.modules[__name__]
+    if path.startswith("/__control"):
+        _serve_control(client, path, method)
+        return
     if path.startswith("/favicon.ico"):
         try:
             client.sendall(b"HTTP/1.1 204 No Content\r\n"
@@ -588,12 +818,13 @@ def handle(client: socket.socket) -> None:
     if not head:
         client.close()
         return
-    try:
-        target = head.split(b" ", 2)[1].decode("latin-1")
-    except IndexError:
-        target = ""
+    # parts after METHOD, so TARGET keeps its whole query string and we never
+    # look past the first line into the body.
+    parts = head.split(b" ", 2)
+    method = parts[0].decode("latin-1") if parts else ""
+    target = parts[1].decode("latin-1") if len(parts) > 1 else ""
     if target.startswith(LOCAL_PREFIXES):
-        _serve_local(client, target)
+        _serve_local(client, target, method)
         client.close()
         return
 
@@ -713,15 +944,65 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="where per-day token totals are kept (default: "
                         "tokens.json beside the log, or in "
                         "%%LOCALAPPDATA%%\\omp-forwarder)")
+    p.add_argument("--wsl-distro", default=None, metavar="NAME",
+                   help="WSL distro that hosts the upstream Docker container "
+                        "(e.g. Ubuntu-24.04). Use together with --container.")
+    p.add_argument("--container", default=None, metavar="NAME",
+                   help="Docker container name inside the distro (e.g. sgl). "
+                        "Use together with --wsl-distro.")
+    p.add_argument("--name", default=None, metavar="TEXT",
+                   help="a human label for this forwarder, shown on the "
+                        "dashboard and in the page title, e.g. 'GPU1 · "
+                        "thinking on'. Useful when two forwarders (one per "
+                        "GPU) run side by side.")
+    p.add_argument("--peer", type=int, action="append", default=[],
+                   metavar="PORT",
+                   help="another forwarder on this machine; rendered as a "
+                        "link in the dashboard header. Repeatable. Links only; "
+                        "peers are never probed.")
     return p.parse_args(argv)
+
+
+def _serve_and_cleanup(serve: Callable[[], None]) -> None:
+    """Run the serve step, then flush day stats and stop the keepalive.
+    finally: must run on every exit path (including exceptions) so the
+    wsl.exe sleep-infinity child is never orphaned and WSL2 can tear the
+    distro down.
+    """
+    try:
+        serve()
+        # Clean exit (tray Exit, or Ctrl-C): flush the day file and say where
+        # today stands, so the log alone answers "how much did I use today".
+        _sample_tokens()
+        _save_days()
+        _log_day(_today(), " at exit")
+    finally:
+        _container_keepalive_stop()
+
 
 
 def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
     global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
-    global UPSTREAM_EXE
+    global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME
+    global _container_status, _container_last_start
+    global FWD_NAME, PEERS, _control_token
     args = _parse_args(argv)
+
+    # Validate the two container flags: both or neither.
+    if (args.wsl_distro and not args.container) or \
+       (args.container and not args.wsl_distro):
+        log("--wsl-distro and --container must be given together")
+        return 1
+
     UPSTREAM_EXE = args.upstream_exe
+    WSL_DISTRO = args.wsl_distro
+    CONTAINER_NAME = args.container
+    FWD_NAME = args.name
+    PEERS = list(args.peer)
+    # One token for the lifetime of this process: the /__control endpoint
+    # checks it, and the dashboard learns it from /__stats.json.
+    _control_token = secrets.token_hex(16)
     LISTEN_PORT = args.port
     STUDIO_PORT = args.studio_port
     FORCED_UPSTREAM = args.upstream_port
@@ -733,6 +1014,11 @@ def main(argv: list[str] | None = None) -> int:
     TOKENS_FILE = args.tokens_file or _default_tokens_file()
     _load_days()
     _last_day = _today()
+
+    if WSL_DISTRO and CONTAINER_NAME:
+        _container_keepalive_start()
+        _poll_container_status()
+        threading.Thread(target=_container_monitor, daemon=True).start()
 
     tray = None
     if args.tray:
@@ -762,6 +1048,7 @@ def main(argv: list[str] | None = None) -> int:
     # Whatever that server counted before now was not our traffic.
     _sample_tokens(baseline=True)
     threading.Thread(target=_token_sampler, daemon=True).start()
+    threading.Thread(target=_upstream_sampler, daemon=True).start()
     log(f"token totals in {TOKENS_FILE}")
     if any(_today_tokens()):
         _log_day(_today(), " so far, from earlier runs")
@@ -771,12 +1058,8 @@ def main(argv: list[str] | None = None) -> int:
         # and the accept loop must not block it, so accept moves to a thread.
         threading.Thread(target=_serve_forever, args=(srv,),
                          daemon=True).start()
-        tray.run()
+        _serve_and_cleanup(tray.run)
     else:
-        _serve_forever(srv)
-    # Clean exit (tray Exit, or Ctrl-C): flush the day file and say where
-    # today stands, so the log alone answers "how much did I use today".
-    _sample_tokens()
-    _save_days()
-    _log_day(_today(), " at exit")
+        _serve_and_cleanup(lambda: _serve_forever(srv))
+
     return 0

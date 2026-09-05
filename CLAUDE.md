@@ -60,6 +60,21 @@ forwarder now waits `--wait-for-model` seconds for a server to appear, then
 answers **503 with Retry-After**. `--studio-fallback` restores the old
 behaviour for a client that does hold the key.
 
+**Container upstreams (SGLang in WSL), added 2026-09-05.** WSL2 shuts the
+distro down when its last `wsl.exe` client exits, and Docker inside it then
+SIGTERMs every container — so `--container` mode holds a `sleep infinity`
+child for the forwarder's lifetime and stops it in a `finally`. SGLang has no
+`/metrics` and no `/slots`: the dashboard light now means `/health`, and
+`metrics_available` says whether the llama-server-only cards have data;
+SGLang's facts come from `/get_server_info`, llama-server's from `/props`,
+never on the request path. `/__control` is POST plus a launch-time token and
+there are no CORS headers anywhere — a foreign page cannot read
+`/__stats.json`, so it cannot learn the token, and GET never mutates. Routing
+reads only the first line and query string, so the relay still parses no
+bodies. Discovery cannot see a container (it matches by executable path), so
+a container upstream needs `--upstream-port`; `--name`/`--peer` exist so two
+lane dashboards tell each other apart.
+
 **Discovery cannot tell two `llama-server` processes apart by port.** It takes
 the highest healthy one. RadHelper runs its own 4B model on a llama-server,
 and excluding Studio's port made discovery silently select that one — a 4B

@@ -108,7 +108,67 @@ itself. Make a desktop shortcut to that file and point the shortcut's icon at
 | `--wait-for-model N` | seconds to wait for a model during a reload (default 30; 0 disables) |
 | `--studio-fallback` | relay to Studio when no model is loaded, instead of 503 |
 | `--tokens-file PATH` | where per-day token totals are kept |
-| `--tray` | Windows tray icon; needs `pywin32` |
+| `--wsl-distro NAME` | WSL distro that hosts the upstream Docker container (use with `--container`) |
+| `--container NAME` | Docker container name inside the distro (use with `--wsl-distro`) |
+| `--name TEXT` | human label for this forwarder, shown on the dashboard and in the page title |
+| `--peer PORT` | another forwarder on this machine; rendered as a link in the dashboard header; repeatable |
+
+## Container-upstream mode
+
+If your `llama-server` runs inside a Docker container inside a WSL distro,
+the forwarder can watch that container's state and keep it running:
+
+```bash
+omp-forwarder --wsl-distro Ubuntu-24.04 --container sgl
+```
+
+Both flags are required together. When given, the forwarder:
+
+- Starts a keepalive process (`wsl -d NAME -u root -- sleep infinity`) that
+  prevents WSL2 from tearing the distro down when its last client exits.
+- Polls `docker inspect -f {{.State.Status}}` every 10 seconds and stores the
+  result. The dashboard shows the container name and its current status in the
+  header bar.
+- Auto-starts the container (`docker start`) at most once per minute when it
+  is in the `exited` state and the relay has no healthy upstream, so a
+  container that keeps crashing is not restarted in a tight loop.
+
+The dashboard's **Container** bit in the header bar is hidden when container
+mode is off. In `GET /__stats.json` the fields are `container` (status string
+or `null`) and `container_name` (the container name, or `null`).
+
+## Dashboard control surface
+
+When running two forwarders side by side (one per GPU, for example), four
+features make the `/__stats` page a truthful control surface rather than a
+bag of zeros:
+
+- **Honest status light.** The header bar's status dot reads `ready`,
+  `unreachable`, or `no direct server`. It is driven by a 10-second
+  background probe of the upstream's `/health` endpoint — not by whether a
+  `/metrics` sample succeeded. SGLang has no `/metrics`; the old light read a
+  healthy SGLang upstream as red "unreachable". When `/metrics` is not
+  provided, every card that depends on it reads "not provided by this
+  upstream" instead of "nothing finished yet".
+
+- **Deployment facts panel.** A background sampler thread refreshes engine
+  type, thinking mode, speculative algorithm, parallelism, and model path
+  every 10 seconds. The engine is detected from whichever endpoint answers:
+  SGLang's `/get_server_info` or llama-server's `/props`. The request path
+  only copies the cached dict.
+
+- **Container controls.** When container-upstream mode is on, the dashboard
+  shows Start / Stop / Restart buttons. They `POST` to a local
+  `/__control?token=<T>&action=<action>` endpoint that runs `docker
+  start|stop|restart` inside the WSL distro. The token is a fresh 32-hex
+  string generated at startup and exposed via `GET /__stats.json`; a foreign
+  page cannot read it because the response sends no CORS headers, and a GET
+  can never mutate.
+
+- **Lane identity.** `--name` sets a human label shown in the page title and
+  header. `--peer` (repeatable) renders links to other forwarders on the
+  same machine, so you can switch between two side-by-side deployments
+  without losing your place.
 
 ## The live dashboard
 

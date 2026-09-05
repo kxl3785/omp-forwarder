@@ -120,6 +120,77 @@ def upstream_model(port: int | None) -> str:
     return name.split("/")[-1]
 
 
+
+def _http_get_json(port: int | None, path: str,
+                   timeout: int = 4) -> dict | None:
+    """GET a JSON endpoint on the upstream, or None on any failure. This is
+    the ONE place the deployment-facts panel talks to the upstream: tests
+    replace this with recorded JSON so they never open a real connection.
+    (The metrics/slots/model readers above keep their own urlopen calls;
+    they are exercised directly by the existing suite, so they stay as they
+    are.)"""
+    if not port:
+        return None
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}{path}", timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def upstream_facts(port: int | None) -> dict:
+    """The deployment facts the dashboard's Deployment panel shows. Refreshed
+    by the forwarder's sampler thread, not on the request path.
+
+    Everything the upstream exposes about itself, read from whichever endpoint
+    it has: SGLang answers /get_server_info, llama-server answers /props. The
+    engine is whichever of those returned 200; "unknown" when neither does.
+    Values the engine does not publish read "unknown" rather than a guess --
+    an em dash on the page beats a wrong answer."""
+    if not port:
+        return {"engine": "unknown", "thinking": "unknown",
+                "speculative": "none", "parallel": "", "model_path": ""}
+    info = _http_get_json(port, "/get_server_info")
+    props = _http_get_json(port, "/props")
+
+    engine = "unknown"
+    if isinstance(info, dict):
+        engine = "sglang"
+    elif isinstance(props, dict):
+        engine = "llama-server"
+
+    facts = {"engine": engine}
+    if engine == "sglang":
+        kwargs = info.get("default_chat_template_kwargs") or {}
+        on = kwargs.get("enable_thinking")
+        facts["thinking"] = "on" if on is True else ("off" if on is False
+                                                    else "unknown")
+        spec = info.get("speculative_algorithm") or "none"
+        facts["speculative"] = spec if spec else "none"
+        tp = info.get("tp_size", 1)
+        pp = info.get("pp_size", 1)
+        facts["parallel"] = f"tp={tp} pp={pp}"
+        facts["model_path"] = info.get("model_path", "") or ""
+    elif engine == "llama-server":
+        # llama-server does not publish speculative or parallel; only the
+        # thinking flag, and only when it is present in the props.
+        kw = props.get("chat_template_kwargs") or {}
+        on = kw.get("enable_thinking")
+        facts["thinking"] = "on" if on is True else ("off" if on is False
+                                                     else "unknown")
+        facts["speculative"] = "unknown"
+        facts["parallel"] = ""
+        facts["model_path"] = props.get("model", "") or ""
+    else:
+        facts["thinking"] = "unknown"
+        facts["speculative"] = "none"
+        facts["parallel"] = ""
+        facts["model_path"] = ""
+    return facts
+
 def snapshot(fwd, stats: dict) -> dict:
     """One JSON sample. Cumulative counters are returned raw -- the page
     differences successive samples for live rates, and differences a stored
@@ -137,6 +208,9 @@ def snapshot(fwd, stats: dict) -> dict:
     lat = sorted(list(stats.get("latency", ()))[-200:])
     g = m.get
     slots = upstream_slots(port)
+    # The keepalive child's pid when container mode is on, else None.
+    _ka = getattr(fwd, "_container_keepalive", None)
+    keepalive_pid = _ka.pid if _ka is not None else None
     return {
         # Context window: llama-server's n_ctx, the same on every slot.
         "ctx": max((s["n_ctx"] for s in slots), default=0),
@@ -146,9 +220,30 @@ def snapshot(fwd, stats: dict) -> dict:
         # Which llama-server executable answered. Discovery cannot tell two
         # of them apart by port, so this is how a wrong one becomes visible.
         "upstream_exe": getattr(fwd, "_upstream_exe", None),
+        "container": getattr(fwd, "_container_status", None),
+        "container_name": getattr(fwd, "CONTAINER_NAME", None),
         "model": stats.get("model") or "-",
         "listen": getattr(fwd, "LISTEN_PORT", None),
         "live": bool(m),
+        # /health (not /metrics) is what every engine answers, so this is the
+        # honest "is the upstream up" light. SGLang has no /metrics, so the
+        # old live==bool(m) read a healthy serving upstream as unreachable.
+        "healthy": bool(getattr(fwd, "_upstream_healthy", False)),
+        # True when the /metrics sample succeeded. When false, every card
+        # that depends on /metrics or /slots must read "not provided by this
+        # upstream" rather than "nothing finished yet".
+        "metrics_available": bool(m),
+        # The deployment facts the Deployment panel shows, refreshed by the
+        # sampler thread; the request path only copies them.
+        "facts": getattr(fwd, "_upstream_facts", {}) or {},
+        # The keepalive child's pid when container mode is on, else null.
+        "keepalive_pid": keepalive_pid,
+        # --- lane identity: name this forwarder and link its peers ---
+        "name": getattr(fwd, "FWD_NAME", None),
+        "peers": list(getattr(fwd, "PEERS", [])),
+        # The /__control token, so the dashboard can authorise its buttons.
+        # See forwarder._control_token for why exposing it is safe.
+        "control_token": getattr(fwd, "_control_token", None),
         # --- forwarder-only: /metrics has no error counter ---
         "conns": stats.get("conns", 0),
         "requests": stats.get("requests", 0),
@@ -194,7 +289,7 @@ def snapshot(fwd, stats: dict) -> dict:
 PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>omp forwarder</title>
+<title id="pg_title">omp forwarder</title>
 <style>
 :root{
   --bg:#0b141a; --panel:#101e26; --panel2:#0d1a21; --line:#1d3440;
@@ -224,7 +319,6 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px}
 /* Two pages, one nav. It rides on the title line and both pages carry an
    identical header, so switching moves nothing on screen but the highlight. */
-.head{display:flex;align-items:center;justify-content:space-between;gap:18px}
 .tabs{display:flex;border:1px solid var(--line);border-radius:8px;
   overflow:hidden;background:var(--panel2);flex:none}
 .tabs a{color:var(--dim);text-decoration:none;font-size:12px;padding:6px 15px;
@@ -288,6 +382,37 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
   color:var(--dim);font-size:12px;line-height:1.65}
 .foot b{color:var(--ink);font-weight:600}
 .foot code{font-family:var(--mono);font-size:11px;color:var(--ink)}
+/* Deployment panel: label/value pairs in one block. Unknowns read as an
+   em dash (rendered by the JS), so a missing fact never reads as a guess. */
+.facts{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:13px 16px;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));
+  gap:8px 24px}
+.facts .row{display:flex;justify-content:space-between;gap:12px}
+.facts .fk{font-size:9.5px;letter-spacing:.1em;color:var(--dim);
+  text-transform:uppercase}
+.facts .fv{font-family:var(--mono);font-size:13px;text-align:right;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.facts .fv.dim{color:var(--dim)}
+/* Container controls: three quiet buttons next to the Container bit. */
+.ctl{display:inline-flex;gap:5px;margin-left:10px}
+.ctl button{appearance:none;background:transparent;border:1px solid var(--line);
+  border-radius:6px;color:var(--dim);cursor:pointer;padding:2px 8px;
+  font:inherit;font-size:10px;letter-spacing:.05em;transition:.15s}
+.ctl button:hover{color:var(--teal);border-color:var(--teal);
+  background:rgba(94,214,203,.07)}
+.ctl button.danger:hover{color:var(--red);border-color:var(--red);
+  background:rgba(226,104,95,.07)}
+#ctl_msg{font-size:11px;color:var(--dim);margin-left:8px}
+/* Peer links ride the title line. */
+.peers{display:flex;gap:8px;margin-left:auto;margin-right:16px;align-items:center}
+.peers a{font-family:var(--mono);font-size:11px;color:var(--dim);
+  text-decoration:none;border:1px solid var(--line);border-radius:6px;
+  padding:2px 8px}
+.peers a:hover{color:var(--teal);border-color:var(--teal)}
+.peers .lbl{font-size:9.5px;letter-spacing:.1em;color:var(--dim);
+  text-transform:uppercase;margin-right:2px}
+.fname{font-family:var(--mono);font-size:15px;color:var(--teal);
+  margin-left:6px;font-weight:600}
 </style>
 <svg style="display:none">
   <symbol id="ico-rst" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -303,7 +428,8 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
   <path d="M5.6 12h12.2M13.3 7.8L18.1 12l-4.8 4.2" fill="none" stroke="#5ed6cb"
         stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
-omp forwarder</h1>
+<span>omp forwarder</span><span class="fname" id="fname"></span></h1>
+<div class="peers" id="peers"></div>
 <nav class="tabs"><a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a></nav>
 </div>
 <div class="sub">Traffic omp sends straight to llama-server &mdash; the requests Unsloth&rsquo;s own API panel cannot see.</div>
@@ -314,6 +440,7 @@ omp forwarder</h1>
   <div class="bit"><span class="bk">Status</span><span class="bv"><span class="dot off" id="dot"></span><span id="state">connecting</span></span></div>
   <div class="bit" style="flex:1"><span class="bk">Model</span><span class="bv" id="model">&mdash;</span></div>
   <div class="bit"><span class="bk">Uptime</span><span class="bv" id="uptime">&mdash;</span></div>
+  <div class="bit"><span class="bk">Container</span><span class="bv" id="cont" title="">&mdash;</span><span class="ctl" id="ctl"><button data-act="start">start</button><button data-act="stop">stop</button><button data-act="restart" class="danger">restart</button></span><span id="ctl_msg"></span></span></div>
   <button class="rst" id="rst-all" title="Reset every section to start from now">
     <svg><use href="#ico-rst"/></svg>Reset all</button>
 </div>
@@ -373,6 +500,16 @@ omp forwarder</h1>
     <div class="v" id="e5">&mdash;</div><div class="n" id="e5_n">HTTP 5xx</div></div>
   <div class="card"><div class="k">Client errors</div>
     <div class="v" id="e4">&mdash;</div><div class="n">HTTP 4xx</div></div>
+</div>
+
+<h2>Deployment<span class="rule"></span></h2>
+<div class="facts" id="facts">
+  <div class="row"><span class="fk">Engine</span><span class="fv dim" id="f_engine">&mdash;</span></div>
+  <div class="row"><span class="fk">Thinking</span><span class="fv dim" id="f_thinking">&mdash;</span></div>
+  <div class="row"><span class="fk">Speculative</span><span class="fv dim" id="f_spec">&mdash;</span></div>
+  <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
+  <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
+  <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
 </div>
 
 <div class="foot">
@@ -467,12 +604,19 @@ async function tick(){
   const M=adj(s,"model"), S=adj(s,"server"), F=adj(s,"fwd");
 
   $("listen").textContent="127.0.0.1:"+s.listen;
+  _ctrlToken=s.control_token||"";
   $("up").textContent=s.upstream?("127.0.0.1:"+s.upstream):"Studio :8888 (fallback)";
   // Hovering names the executable: two llama-servers look identical here.
   $("up").title = s.upstream_exe || "";
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
-  $("dot").className="dot "+(s.live?"on":"off");
-  $("state").textContent=s.live?"ready":(s.upstream?"unreachable":"no direct server");
+  $("dot").className="dot "+(s.healthy?"on":"off");
+  $("state").textContent=s.healthy?"ready":(s.upstream?"unreachable":"no direct server");
+  if(s.container_name){
+    $("cont").textContent=s.container_name+" · "+(s.container||"unknown");
+    $("cont").title="container "+s.container_name+" in WSL distro; status: "+(s.container||"unknown");
+  } else {
+    $("cont").textContent=""; $("cont").title="";
+  }
 
   // in flight / largest context are instantaneous, never baselined
   $("inflight").textContent=s.processing;
@@ -571,6 +715,43 @@ async function tick(){
         + (avg ? (sess?'<span class="tag">session</span>':LIFE) : ""); }
     else { $("acc").textContent="—"; $("acc_n").textContent="no drafts yet"; }
   }
+  // --- lane identity: name, peers, title ---
+  if(s.name){ $("fname").textContent="· "+s.name;
+    $("pg_title").textContent="omp forwarder · "+s.name; }
+  else { $("fname").textContent="";
+    $("pg_title").textContent="omp forwarder"; }
+  const pb=$("peers");
+  if(s.peers && s.peers.length){
+    pb.innerHTML='<span class="lbl">Peers</span>'
+      +s.peers.map(pp=>'<a href="/__stats" data-peer="'+pp+'" target="_blank">'+pp+'</a>').join("");
+  } else { pb.innerHTML=""; }
+
+  // --- deployment facts ---
+  const F2=s.facts||{};
+  const setF=(id,v)=>{ const el=$(id);
+    if(v && v!=="unknown" && v!=="none"){ el.textContent=v; el.classList.remove("dim"); }
+    else { el.innerHTML=(v==="none")?"none":"&mdash;"; el.classList.add("dim"); } };
+  setF("f_engine", F2.engine);
+  setF("f_thinking", F2.thinking);
+  setF("f_spec", F2.speculative==="none"?"none":(F2.speculative||"unknown"));
+  setF("f_par", F2.parallel);
+  setF("f_model", F2.model_path);
+  const kaEl=$("f_ka");
+  if(s.keepalive_pid){ kaEl.textContent=s.keepalive_pid; kaEl.classList.remove("dim"); }
+  else { kaEl.innerHTML="&mdash;"; kaEl.classList.add("dim"); }
+
+  // --- control buttons: only visible when container mode is on ---
+  const ctl=$("ctl");
+  if(s.container_name && s.control_token){
+    ctl.style.display="";
+  } else { ctl.style.display="none"; }
+
+  // --- dim metric cards when /metrics is unavailable ---
+  if(!s.metrics_available){
+    document.querySelectorAll(".grid .v").forEach(el=>el.classList.add("dim"));
+  } else {
+    document.querySelectorAll(".grid .v").forEach(el=>el.classList.remove("dim"));
+  }
   prev=s;
 }
 function meterSet(el,pct,warn,bad){el.style.width=Math.max(0,Math.min(100,pct))+"%";
@@ -643,6 +824,23 @@ function renderSlots(s){
     +"</table>";
   return out;
 }
+// Control buttons: POST to /__control with the token from the last sample.
+let _ctrlToken="";
+document.querySelectorAll("#ctl button").forEach(btn=>{
+  btn.addEventListener("click",async ()=>{
+    if(!_ctrlToken) return;
+    const act=btn.dataset.act;
+    document.querySelectorAll("#ctl button").forEach(b=>b.disabled=true);
+    try{
+      const r=await fetch("/__control?token="+encodeURIComponent(_ctrlToken)
+        +"&action="+act,{method:"POST",cache:"no-store"});
+      const j=await r.json();
+      $("ctl_msg").textContent=j.status?("-> "+j.status):(j.error||"");
+    }catch(e){ $("ctl_msg").textContent="request failed"; }
+    setTimeout(()=>{ $("ctl_msg").textContent="";
+      document.querySelectorAll("#ctl button").forEach(b=>b.disabled=false); },3000);
+  });
+});
 tick(); setInterval(tick,3000);
 </script>
 """

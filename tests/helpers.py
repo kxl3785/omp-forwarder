@@ -97,6 +97,20 @@ def reset_state() -> None:
     fwd._day_totals = {}
     fwd._days_dirty = False
     fwd._last_day = None
+    # Container-upstream mode state
+    fwd.WSL_DISTRO = None
+    fwd.CONTAINER_NAME = None
+    fwd._container_status = None
+    fwd._container_keepalive = None
+    fwd._container_last_start = 0.0
+    # Upstream health + deployment facts, refreshed by the sampler thread.
+    fwd._upstream_healthy = False
+    fwd._upstream_facts = {}
+    # The /__control auth token, generated in main().
+    fwd._control_token = ""
+    # Lane identity: --name and --peer flags.
+    fwd.FWD_NAME = None
+    fwd.PEERS = []
 
 
 class FakeUpstream:
@@ -129,6 +143,14 @@ class FakeUpstream:
                                       "application/json")]
             return [http_response(503, b'{"status":"loading"}',
                                   "application/json")]
+        # Deployment-fact endpoints. SGLang answers /get_server_info;
+        # llama-server answers /props. Both 404 by default so that
+        # upstream_facts() reads "unknown" for the engine.
+        if path == "/get_server_info":
+            return [http_response(200, b'{"default_chat_template_kwargs":{"enable_thinking":false},"speculative_algorithm":"","tp_size":1,"pp_size":1,"model_path":"/models/test"}',
+                                  "application/json")]
+        if path == "/props":
+            return [http_response(404)]
         return [http_response(404)]
 
     def _accept(self) -> None:
