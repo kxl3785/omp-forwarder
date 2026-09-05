@@ -276,6 +276,15 @@ def snapshot(fwd, stats: dict) -> dict:
         # The /__control token, so the dashboard can authorise its buttons.
         # See forwarder._control_token for why exposing it is safe.
         "control_token": getattr(fwd, "_control_token", None),
+        # The operator pressed stop; auto-start stays off until start.
+        "operator_stopped": bool(getattr(fwd, "_operator_stopped", False)),
+        # PID behind a process upstream, from the netstat scan; null for a
+        # container or when unknown. Read-only lookup, safe on this path.
+        "upstream_pid": (fwd._upstream_pid()
+                         if hasattr(fwd, "_upstream_pid") else None),
+        # True when --upstream-cmd was given, so start/restart exist on a
+        # process lane; without it only stop is offered.
+        "upstream_cmd": bool(getattr(fwd, "UPSTREAM_CMD", None)),
         # --- forwarder-only: /metrics has no error counter ---
         "conns": stats.get("conns", 0),
         "requests": stats.get("requests", 0),
@@ -546,7 +555,7 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
   background:rgba(94,214,203,.07)}
 .ctl button.danger:hover{color:var(--red);border-color:var(--red);
   background:rgba(226,104,95,.07)}
-#ctl_msg{font-size:11px;color:var(--dim);margin-left:8px}
+.ctl_msg{font-size:11px;color:var(--dim);margin-left:8px}
 .pill{display:inline-block;font-family:var(--mono);font-size:11px;
   border:1px solid var(--line);background:transparent;border-radius:10px;
   padding:1px 7px;color:var(--dim);letter-spacing:.04em}
@@ -564,7 +573,8 @@ __HEADER__
   <div class="bit"><span class="bk">Status</span><span class="bv"><span class="dot off" id="dot"></span><span id="state">connecting</span></span></div>
   <div class="bit" style="flex:1"><span class="bk">Model</span><span class="bv" id="model">&mdash;</span></div>
   <div class="bit"><span class="bk">Uptime</span><span class="bv" id="uptime">&mdash;</span></div>
-  <div class="bit" id="contbit" hidden><span class="bk">Container</span><span class="bv" id="cont" title="">&mdash;</span><span class="ctl" id="ctl"><button data-act="start">start</button><button data-act="stop">stop</button><button data-act="restart" class="danger">restart</button></span><span id="ctl_msg"></span></span></div>
+  <div class="bit" id="contbit" hidden><span class="bk">Container</span><span class="bv" id="cont" title="">&mdash;</span><span class="ctl"><button data-act="start">start</button><button data-act="stop">stop</button><button data-act="restart" class="danger">restart</button></span><span class="ctl_msg"></span></div>
+  <div class="bit" id="procbit" hidden><span class="bk">Upstream process</span><span class="bv" id="proc" title="">&mdash;</span><span class="ctl"><button data-act="start" data-needs-cmd>start</button><button data-act="stop" class="danger">stop</button><button data-act="restart" class="danger" data-needs-cmd>restart</button></span><span class="ctl_msg"></span></div>
   <button class="rst" id="rst-all" title="Reset every section to start from now">
     <svg><use href="#ico-rst"/></svg>Reset all</button>
 </div>
@@ -757,11 +767,22 @@ async function tick(){
   // The whole Container bit, label included, exists only in container mode.
   // A lane fronting a plain llama-server showed an empty "CONTAINER" label.
   $("contbit").hidden=!s.container_name;
+  const latched=s.operator_stopped?" · stopped by operator":"";
   if(s.container_name){
-    $("cont").textContent=s.container_name+" · "+(s.container||"unknown");
+    $("cont").textContent=s.container_name+" · "+(s.container||"unknown")+latched;
     $("cont").title="container "+s.container_name+" in WSL distro; status: "+(s.container||"unknown");
   } else {
     $("cont").textContent=""; $("cont").title="";
+  }
+  // Process lane: shown when the scan knows the upstream's PID or a start
+  // command exists, and never beside a container. start/restart need the
+  // command; stop needs only the PID.
+  const proc=!s.container_name && (s.upstream_pid || s.upstream_cmd);
+  $("procbit").hidden=!proc;
+  if(proc){
+    $("proc").textContent=(s.upstream_pid?("pid "+s.upstream_pid):"not running")+latched;
+    $("proc").title=s.upstream_cmd?"start runs --upstream-cmd on the host":"no --upstream-cmd: stop only";
+    document.querySelectorAll("#procbit [data-needs-cmd]").forEach(b=>{ b.hidden=!s.upstream_cmd; });
   }
 
   // --- forwarder-only cards: always live ---
@@ -1088,19 +1109,23 @@ function renderSlots(s){
 }
 // Control buttons: POST to /__control with the token from the last sample.
 let _ctrlToken="";
-document.querySelectorAll("#ctl button").forEach(btn=>{
+document.querySelectorAll(".ctl button").forEach(btn=>{
   btn.addEventListener("click",async ()=>{
     if(!_ctrlToken) return;
     const act=btn.dataset.act;
-    document.querySelectorAll("#ctl button").forEach(b=>b.disabled=true);
+    // Scope the disable and the message to this bit: the Container and the
+    // Upstream-process bits each carry their own button group.
+    const bit=btn.closest(".bit"), msg=bit.querySelector(".ctl_msg");
+    if(act!=="start" && !confirm(act+" the upstream? This frees its GPU.")) return;
+    bit.querySelectorAll("button").forEach(b=>b.disabled=true);
     try{
       const r=await fetch("/__control?token="+encodeURIComponent(_ctrlToken)
         +"&action="+act,{method:"POST",cache:"no-store"});
       const j=await r.json();
-      $("ctl_msg").textContent=j.status?("-> "+j.status):(j.error||"");
-    }catch(e){ $("ctl_msg").textContent="request failed"; }
-    setTimeout(()=>{ $("ctl_msg").textContent="";
-      document.querySelectorAll("#ctl button").forEach(b=>b.disabled=false); },3000);
+      msg.textContent=j.status?("-> "+j.status):(j.error||"");
+    }catch(e){ msg.textContent="request failed"; }
+    setTimeout(()=>{ msg.textContent="";
+      bit.querySelectorAll("button").forEach(b=>b.disabled=false); },3000);
   });
 });
 tick(); setInterval(tick,3000);

@@ -490,3 +490,9 @@ is one drawing at every size, so a 16px tray icon is the same logo as the
 ## License
 
 MIT
+
+## Unloading a GPU from the dashboard
+
+`stop` is the unload. On a container lane it runs `docker stop`, which frees the GPU the container held; on a plain-process lane it terminates the PID the netstat scan attributed to the upstream port. Either way the stop latches: the container monitor will not auto-start what you just unloaded until you press `start` or `restart`, and the bit reads `stopped by operator` while the latch holds.
+
+`start` and `restart` on a process lane need `--upstream-cmd COMMAND`, the command that launches that lane's model server (run on the host exactly as given). Without it the lane can be stopped but not started, and the dashboard shows only `stop`; `/__control` answers 409 to a start. Stopping a server that Unsloth Studio launched frees the GPU but leaves Studio's UI believing it is loaded; unload Studio's own lane from Studio.

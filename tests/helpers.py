@@ -119,6 +119,10 @@ def reset_state() -> None:
     # Per-peer and GPU sampler state.
     fwd._peer_state = {}
     fwd._gpu_state = []
+    # Unload control: the start command and the operator's stop latch.
+    fwd.UPSTREAM_CMD = None
+    fwd._operator_stopped = False
+    fwd._upstream_child = None
 
 
 class FakeUpstream:

@@ -221,7 +221,7 @@ class ControlEndpointTests(RelayCase):
         status, body = self._post("?token=tok123&action=start")
         self.assertIn("404", status)
         self.assertFalse(body["ok"])
-        self.assertEqual(body["error"], "container mode off")
+        self.assertEqual(body["error"], "nothing to control")
 
     def test_get_returns_405(self):
         fwd.WSL_DISTRO = "Ubuntu-24.04"
@@ -321,7 +321,7 @@ class ControlActionTests(ForwarderCase):
     """_control_action: the WSL docker seam."""
 
     def test_no_flags(self):
-        self.assertEqual(fwd._control_action("start"), "error")
+        self.assertEqual(fwd._control_action("start"), "no-command")
 
     def test_invalid_action(self):
         fwd.WSL_DISTRO = "Ubuntu-24.04"

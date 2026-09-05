@@ -40,6 +40,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import socket
 import subprocess
 import sys
@@ -76,6 +77,18 @@ PEERS: list[int] = []
 #: declares it: no server exposes it, so the dashboard's GPU panel cannot
 #: infer it either. None when unset.
 FWD_GPU: int | None = None
+#: Command that starts this lane's model server when the upstream is a plain
+#: process (from --upstream-cmd). Without it a process lane can be stopped
+#: from the dashboard but not started: the forwarder knows the PID from the
+#: netstat scan, but nothing tells it how the server was launched.
+UPSTREAM_CMD: str | None = None
+#: Set when the operator pressed stop, cleared by start/restart. While set,
+#: the container monitor must not auto-start an exited container -- an
+#: "unload the GPU" button that quietly reloads the GPU a minute later is
+#: worse than no button.
+_operator_stopped: bool = False
+#: The process started by --upstream-cmd, if any, so it is not orphaned.
+_upstream_child: subprocess.Popen | None = None
 
 
 #: Container-upstream mode, enabled when both --wsl-distro and --container are
@@ -273,6 +286,14 @@ def _spawn_wsl(args: list[str]) -> subprocess.Popen:
                             stderr=subprocess.DEVNULL)
 
 
+def _spawn_host(args: list[str]) -> subprocess.Popen:
+    """Long-lived host child: the model server launched by --upstream-cmd.
+    Its own seam, so tests can assert what would be started without
+    starting anything."""
+    return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+
+
 def _poll_container_status() -> None:
     """Read docker inspect once and remember the result in _container_status.
     Runs on the monitor thread's timer; never on the request path."""
@@ -289,8 +310,10 @@ def _poll_container_status() -> None:
     _container_status = res.stdout.strip() or "error"
     # Auto-start once per minute: docker start on an exited container, but
     # only when the relay has no healthy upstream, so a container that keeps
-    # crashing is not restarted in a tight loop.
-    if _container_status == "exited" and _upstream is None:
+    # crashing is not restarted in a tight loop -- and never while the
+    # operator's own stop is in force, or the stop button would be a lie.
+    if (_container_status == "exited" and _upstream is None
+            and not _operator_stopped):
         now = time.time()
         if now - _container_last_start >= 60:
             _container_last_start = now
@@ -516,6 +539,10 @@ def _upstream_sampler() -> None:
         _sample_upstream_facts()
         _sample_peers()
         _sample_gpus()
+        # The owner PID of a process upstream, so the Upstream-process bit
+        # can say "pid N" and stop has something to terminate. The exe scan
+        # never records it for an explicit or candidate port.
+        _refresh_upstream_pid()
 
 
 def _exe_path(pid: str | int) -> str | None:
@@ -921,21 +948,97 @@ LOCAL_PREFIXES = ("/__stats", "/__usage", "/__control", "/favicon.ico")
 
 
 
+def _upstream_pid() -> str | None:
+    """PID of the process behind the current upstream, as recorded in
+    _port_owner, or None when the upstream is a container or unknown. A
+    dictionary lookup only: this runs on the /__stats.json request path."""
+    if WSL_DISTRO and CONTAINER_NAME:
+        return None
+    if _upstream is None:
+        return None
+    return _port_owner.get(_upstream)
+
+
+def _port_pid(port: int | None) -> str | None:
+    """Owning PID of one listening TCP port, from a single netstat pass, any
+    executable. The executable scan records owners only for llama-server
+    PIDs it matched, so an explicit --upstream-port or a candidate port
+    never gets one -- and the first live test of the stop button answered
+    "no upstream process to stop" with a 27B model plainly running. Goes
+    through _run_host so tests replace it. Windows only, like the scan."""
+    if os.name != "nt" or port is None:
+        return None
+    res = _run_host(["netstat", "-ano", "-p", "TCP"], timeout=30)
+    if res is None:
+        return None
+    suffix = f":{port}"
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if (len(parts) >= 5 and parts[-2] == "LISTENING"
+                and parts[1].endswith(suffix)):
+            return parts[-1]
+    return None
+
+
+def _refresh_upstream_pid() -> None:
+    """Record the owner of a process upstream so the dashboard and the stop
+    control know it. Called from the monitor thread, and once on demand by
+    the control handler; never from the request path."""
+    if WSL_DISTRO and CONTAINER_NAME:
+        return
+    port = _upstream
+    if port is None:
+        return
+    pid = _port_pid(port)
+    if pid:
+        _port_owner[port] = pid
+    else:
+        _port_owner.pop(port, None)
+
+
 def _control_action(action: str, timeout: float = 30.0) -> str:
-    """Run `docker <action> CONTAINER_NAME` in the WSL distro via the
-    _run_wsl seam, then re-read the container status once and return it.
-    Only start/stop/restart are accepted; anything else is "" so the caller
-    can reject it. Never called on the relay path: the handler runs it
-    synchronously because /__control is a local path, not the relay."""
-    if not WSL_DISTRO or not CONTAINER_NAME:
-        return "error"
+    """Apply start/stop/restart to whatever this lane fronts; return a status.
+
+    Container lane: `docker <action> CONTAINER_NAME` through _run_wsl, then
+    one status re-read. Process lane: stop terminates the PID the netstat
+    scan attributed to the upstream port; start runs UPSTREAM_CMD through
+    _spawn_host, or answers "no-command" when none was given; restart is the
+    two in sequence. "stop" is the unload: for a container it frees the GPU
+    the container held, for a process it ends the server holding it.
+
+    stop sets _operator_stopped and start/restart clear it, so the container
+    monitor's auto-start cannot undo a deliberate unload. Never called on the
+    relay path: /__control is a local path, so the handler runs it inline."""
+    global _operator_stopped, _upstream_child
     if action not in ("start", "stop", "restart"):
         return "error"
-    _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
-              "docker", action, CONTAINER_NAME],
-             timeout=timeout)
-    _poll_container_status()
-    return _container_status or "error"
+    if WSL_DISTRO and CONTAINER_NAME:
+        _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+                  "docker", action, CONTAINER_NAME],
+                 timeout=timeout)
+        _operator_stopped = (action == "stop")
+        _poll_container_status()
+        return _container_status or "error"
+    status = "error"
+    if action in ("stop", "restart"):
+        pid = _upstream_pid()
+        if pid is None:
+            return "no-process"
+        if os.name == "nt":
+            _run_host(["taskkill", "/PID", str(pid), "/F"], timeout=timeout)
+        else:
+            _run_host(["kill", str(pid)], timeout=timeout)
+        _operator_stopped = True
+        status = "stopped"
+    if action in ("start", "restart"):
+        if not UPSTREAM_CMD:
+            return "no-command"
+        # posix=False on Windows keeps backslashes in paths intact.
+        _upstream_child = _spawn_host(
+            shlex.split(UPSTREAM_CMD, posix=(os.name != "nt")))
+        _operator_stopped = False
+        status = "starting"
+    return status
 
 
 def _serve_control(client: socket.socket, path: str, method: str) -> None:
@@ -969,9 +1072,17 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
         except OSError:
             pass
 
-    # Container mode off: nothing to control.
-    if not (WSL_DISTRO and CONTAINER_NAME):
-        reply("404 Not Found", {"ok": False, "error": "container mode off"})
+    # Learn the PID before judging what is controllable: the monitor fills it
+    # every 10 s, but a click right after startup arrives sooner, and an
+    # unknown PID must not read as "nothing to control". One netstat pass on
+    # a local control request; the relay never waits on it.
+    if not (WSL_DISTRO and CONTAINER_NAME) and _upstream_pid() is None:
+        _refresh_upstream_pid()
+    # Nothing to control: no container, no process behind the upstream port,
+    # and no command that could start one.
+    if not ((WSL_DISTRO and CONTAINER_NAME) or _upstream_pid()
+            or UPSTREAM_CMD):
+        reply("404 Not Found", {"ok": False, "error": "nothing to control"})
         return
     # Only POST mutates; a GET can never do anything.
     if method != "POST":
@@ -985,6 +1096,15 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
         reply("400 Bad Request", {"ok": False, "error": "unknown action"})
         return
     status = _control_action(action)
+    if status == "no-command":
+        reply("409 Conflict", {"ok": False, "action": action,
+                               "error": "no --upstream-cmd: this lane can "
+                                        "stop its process but not start one"})
+        return
+    if status == "no-process":
+        reply("409 Conflict", {"ok": False, "action": action,
+                               "error": "no upstream process to stop"})
+        return
     reply("200 OK", {"ok": True, "action": action, "status": status})
 
 
@@ -1257,6 +1377,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="another forwarder on this machine; rendered as a "
                         "link in the dashboard header. Repeatable. Links only; "
                         "peers are never probed.")
+    p.add_argument("--upstream-cmd", default=None, metavar="COMMAND",
+                   help="command that starts this lane's model server when "
+                        "it is a plain process (not a container). Enables "
+                        "start/restart on the dashboard; stop works without "
+                        "it. Run on the host exactly as given.")
     p.add_argument("--gpu", type=int, default=None, metavar="N",
                    help="index of the GPU this lane's model server runs on. "
                         "A label: no server exposes it, so the dashboard's "
@@ -1285,7 +1410,7 @@ def _serve_and_cleanup(serve: Callable[[], None]) -> None:
 def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
     global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
-    global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME
+    global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME, UPSTREAM_CMD
     global CANDIDATE_PORTS, PREFER
     global _container_status, _container_last_start
     global FWD_NAME, PEERS, FWD_GPU, _control_token
@@ -1304,6 +1429,7 @@ def main(argv: list[str] | None = None) -> int:
     CONTAINER_NAME = args.container
     FWD_NAME = args.name
     FWD_GPU = args.gpu
+    UPSTREAM_CMD = args.upstream_cmd
     PEERS = list(args.peer)
     # A new process: any peer/GPU state is stale and must not survive.
     _peer_state.clear()

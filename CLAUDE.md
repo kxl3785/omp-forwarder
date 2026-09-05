@@ -72,6 +72,11 @@ there are no CORS headers anywhere — a foreign page cannot read
 `/__stats.json`, so it cannot learn the token, and GET never mutates. Routing
 reads only the first line and query string, so the relay still parses no
 bodies. `--name`/`--peer` exist so two lane dashboards tell each other apart.
+**The dashboard's stop latches.** Auto-start restarted an exited container
+within a minute of the operator stopping it, which turned "unload the GPU"
+into "reload the GPU". `_operator_stopped` is set by stop and cleared by
+start/restart, and `_poll_container_status` honours it. On a process lane
+stop terminates the PID from the netstat scan; start needs `--upstream-cmd`.
 
 **Discovery sees two kinds of upstream, and re-evaluates.** Executable
 matching cannot see a container, so candidates also come from
