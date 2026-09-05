@@ -304,9 +304,15 @@ def _spawn_host(args: list[str]) -> subprocess.Popen:
                             stderr=subprocess.DEVNULL)
 
 
-def _poll_container_status() -> None:
+def _poll_container_status(auto_start: bool = True) -> None:
     """Read docker inspect once and remember the result in _container_status.
-    Runs on the monitor thread's timer; never on the request path."""
+    Runs on the monitor thread's timer; never on the request path.
+
+    auto_start=False for the call main() makes at startup. At that moment
+    discover() has not yet assigned _upstream, so an exited container looked
+    like "no upstream, container down" and was started -- a fresh forwarder
+    reloaded a GPU the operator had just unloaded. Only the monitor thread,
+    which runs after discovery, may auto-start."""
     global _container_status, _container_last_start
     if not WSL_DISTRO or not CONTAINER_NAME:
         return
@@ -322,7 +328,7 @@ def _poll_container_status() -> None:
     # only when the relay has no healthy upstream, so a container that keeps
     # crashing is not restarted in a tight loop -- and never while the
     # operator's own stop is in force, or the stop button would be a lie.
-    if (_container_status == "exited" and _upstream is None
+    if (auto_start and _container_status == "exited" and _upstream is None
             and not _operator_stopped):
         now = time.time()
         if now - _container_last_start >= 60:
@@ -969,6 +975,45 @@ def _upstream_pid() -> str | None:
     return _port_owner.get(_upstream)
 
 
+def _latch_path() -> str | None:
+    """Where the operator's stop is remembered: beside tokens.json, one file
+    per listen port so two lanes on one machine do not share a latch."""
+    if not TOKENS_FILE:
+        return None
+    return os.path.join(os.path.dirname(TOKENS_FILE),
+                        f"control-{LISTEN_PORT}.json")
+
+
+def _load_latch() -> None:
+    """Restore _operator_stopped from disk at startup. The latch used to live
+    only in memory, so restarting the forwarder forgot the operator's stop
+    and the container monitor reloaded the GPU within a minute. An unload
+    must outlive the process that performed it."""
+    global _operator_stopped
+    path = _latch_path()
+    if not path:
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            _operator_stopped = bool(json.load(fh).get("operator_stopped"))
+    except (OSError, ValueError):
+        _operator_stopped = False
+
+
+def _save_latch() -> None:
+    path = _latch_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"operator_stopped": _operator_stopped}, fh)
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f"cannot write {path}: {exc!r}")
+
+
 def _port_pid(port: int | None) -> str | None:
     """Owning PID of one listening TCP port, from a single netstat pass, any
     executable. The executable scan records owners only for llama-server
@@ -1027,6 +1072,7 @@ def _control_action(action: str, timeout: float = 30.0) -> str:
                   "docker", action, CONTAINER_NAME],
                  timeout=timeout)
         _operator_stopped = (action == "stop")
+        _save_latch()
         _poll_container_status()
         return _container_status or "error"
     status = "error"
@@ -1039,6 +1085,7 @@ def _control_action(action: str, timeout: float = 30.0) -> str:
         else:
             _run_host(["kill", str(pid)], timeout=timeout)
         _operator_stopped = True
+        _save_latch()
         status = "stopped"
     if action in ("start", "restart"):
         if not UPSTREAM_CMD:
@@ -1047,6 +1094,7 @@ def _control_action(action: str, timeout: float = 30.0) -> str:
         _upstream_child = _spawn_host(
             shlex.split(UPSTREAM_CMD, posix=(os.name != "nt")))
         _operator_stopped = False
+        _save_latch()
         status = "starting"
     return status
 
@@ -1458,10 +1506,15 @@ def main(argv: list[str] | None = None) -> int:
     TOKENS_FILE = args.tokens_file or _default_tokens_file()
     _load_days()
     _last_day = _today()
+    # The operator's stop from a previous run of this lane, if any. Loaded
+    # before the container poll so an unloaded GPU stays unloaded.
+    _load_latch()
 
     if WSL_DISTRO and CONTAINER_NAME:
         _container_keepalive_start()
-        _poll_container_status()
+        # Status only: discover() has not run yet, so an auto-start here
+        # would act on "no upstream" that is merely "not looked yet".
+        _poll_container_status(auto_start=False)
         _container_port_from_docker()
         threading.Thread(target=_container_monitor, daemon=True).start()
 

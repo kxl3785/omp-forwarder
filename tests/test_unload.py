@@ -212,6 +212,69 @@ class StopResolvesPidOnDemandTests(RelayCase):
         self.assertIn("4242", seen[1])
 
 
+class StartupPollNeverAutoStartsTests(ForwarderCase):
+    """main() polls once at startup, before discover() has assigned the
+    upstream. That poll must never auto-start: a fresh forwarder reloaded a
+    GPU the operator had just unloaded, because _upstream was None for that
+    instant and the in-memory latch was empty."""
+
+    def test_auto_start_false_skips_docker_start(self):
+        fwd.WSL_DISTRO, fwd.CONTAINER_NAME = "d", "sgl"
+        fwd._upstream = None
+        fwd._operator_stopped = False
+        fwd._container_last_start = 0.0
+        seen = []
+        with mock.patch.object(fwd, "_run_wsl",
+                               side_effect=lambda a, timeout=10.0:
+                               seen.append(a) or _completed("exited")):
+            fwd._poll_container_status(auto_start=False)
+        self.assertEqual([a for a in seen if "start" in a], [])
+        self.assertEqual(fwd._container_status, "exited")
+
+
+class LatchPersistsTests(ForwarderCase):
+    """The operator's stop outlives the forwarder process."""
+
+    def setUp(self):
+        super().setUp()
+        import tempfile, os as _os
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
+        fwd.TOKENS_FILE = _os.path.join(self.tmp, "tokens.json")
+        fwd.LISTEN_PORT = 8899
+        fwd.WSL_DISTRO, fwd.CONTAINER_NAME = "d", "sgl"
+
+    def test_stop_is_remembered_across_a_restart(self):
+        with mock.patch.object(fwd, "_run_wsl", return_value=_completed("exited")):
+            fwd._control_action("stop")
+        self.assertTrue(fwd._operator_stopped)
+        # A new process: memory empty, disk remembers.
+        fwd._operator_stopped = False
+        fwd._load_latch()
+        self.assertTrue(fwd._operator_stopped)
+
+    def test_start_clears_the_remembered_stop(self):
+        with mock.patch.object(fwd, "_run_wsl", return_value=_completed("running")):
+            fwd._control_action("stop")
+            fwd._control_action("start")
+        fwd._operator_stopped = True
+        fwd._load_latch()
+        self.assertFalse(fwd._operator_stopped)
+
+    def test_latch_is_per_listen_port(self):
+        with mock.patch.object(fwd, "_run_wsl", return_value=_completed("exited")):
+            fwd._control_action("stop")
+        fwd.LISTEN_PORT = 8898
+        fwd._operator_stopped = False
+        fwd._load_latch()
+        self.assertFalse(fwd._operator_stopped, "another lane must not inherit this lane's stop")
+
+    def test_missing_file_means_not_stopped(self):
+        fwd._operator_stopped = True
+        fwd._load_latch()
+        self.assertFalse(fwd._operator_stopped)
+
+
 class ModuleGlobalsAreDefinedTests(unittest.TestCase):
     """Every name a function declares `global` must be assigned at module
     level. reset_state() creates such attributes for the tests, so a missing
