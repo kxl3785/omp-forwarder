@@ -41,13 +41,30 @@ _STARTED = time.time()
 
 
 def parse_metrics(text: str) -> dict:
-    out = {}
+    """Parse a Prometheus body. llama-server's lines have no labels; SGLang's
+    carry a {label="value",...} block between the name and the value. The
+    name is what we key on, so labels are stripped first.
+
+    SGLang emits the SAME name once per label set (one line per engine
+    instance / rank), so a key may appear on several lines. The spec says
+    to sum those duplicates, not keep the last: the last one would
+    under-count every metric the engine splits across ranks."""
+    out: dict[str, float] = {}
     for line in text.splitlines():
-        if line.startswith("#") or not line.strip():
+        s = line.strip()
+        if not s or s.startswith("#"):
             continue
-        key, _, val = line.partition(" ")
+        # name{labels} value  ->  name value. The value is whatever follows
+        # the closing brace, when one is present; the label block itself is
+        # dropped. Without the brace, the value is the last field.
+        head, _, tail = s.partition("}")
+        # head = "name{labels" or just "name".
+        name = head.split("{", 1)[0].split(" ", 1)[0]
+        if not name:
+            continue
+        val = tail.strip() if tail else head.rsplit(" ", 1)[-1]
         try:
-            out[key] = float(val)
+            out[name] = out.get(name, 0.0) + float(val)
         except ValueError:
             pass
     return out
@@ -247,7 +264,15 @@ def snapshot(fwd, stats: dict) -> dict:
         "keepalive_pid": keepalive_pid,
         # --- lane identity: name this forwarder and link its peers ---
         "name": getattr(fwd, "FWD_NAME", None),
-        "peers": list(getattr(fwd, "PEERS", [])),
+        # GPU index this lane runs on, from --gpu. A label: no server
+        # exposes it, so the dashboard's GPU panel cannot infer it either.
+        "gpu": getattr(fwd, "FWD_GPU", None),
+        # Per-peer state the monitor thread last read, one dict per --peer.
+        # The request path only copies the dict; it never re-probes.
+        "peers": [dict(v) for v in getattr(fwd, "_peer_state", {}).values()],
+        # GPU rows the monitor thread last read from nvidia-smi. Empty when
+        # the binary is missing or failed; the panel says "no GPU data".
+        "gpus": [dict(v) for v in getattr(fwd, "_gpu_state", [])],
         # The /__control token, so the dashboard can authorise its buttons.
         # See forwarder._control_token for why exposing it is safe.
         "control_token": getattr(fwd, "_control_token", None),
@@ -288,17 +313,38 @@ def snapshot(fwd, stats: dict) -> dict:
         "processing": g("llamacpp:requests_processing", 0),
         "deferred": g("llamacpp:requests_deferred", 0),
         "tokens_max": g("llamacpp:n_tokens_max", 0),
+        # --- SGLang: the same cards, different metric names ---
+        # sglang:gen_throughput is a live gauge, not a counter: the page
+        # shows it directly rather than differencing it.
+        "gen_throughput": g("sglang:gen_throughput", 0.0),
+        # num_running_reqs plus num_queue_reqs, shown as "queued N".
+        "sglang_running": g("sglang:num_running_reqs", 0),
+        "sglang_queued": g("sglang:num_queue_reqs", 0),
+        # 0..1, shown as a percent.
+        "sglang_cache_hit_rate": g("sglang:cache_hit_rate", 0.0),
+        # An accepted LENGTH, not a percent: the page shows "tau 3.2".
+        "sglang_spec_accept_length": g("sglang:spec_accept_length", 0.0),
+        # The server's own context window, shown on the Largest context card.
+        "sglang_context_len": g("sglang:context_len", 0.0),
+        # 0..1, KV pool occupancy, shown on the Server row.
+        "sglang_token_usage": g("sglang:token_usage", 0.0),
+        # Counters the forwarder's tally folds: cumulative, restart at zero
+        # on a server restart. The tally treats a backwards counter as a new
+        # process, so its value is added whole.
+        "sglang_prompt_tokens": g("sglang:prompt_tokens_total", 0),
+        "sglang_gen_tokens": g("sglang:generation_tokens_total", 0),
+        # Informational: the server's own request count, not the forwarder's.
+        "sglang_requests_total": g("sglang:num_requests_total", 0),
         # Per-stream, from /slots. /metrics cannot give this.
         "slots": slots,
     }
 
 
-PAGE = r"""<!doctype html>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title id="pg_title">omp forwarder</title>
-<style>
-:root{
+#: The header both pages share: the title mark, the tab switch, the lane
+#: name and the peer pills. Kept in one place so the two pages cannot drift
+#: apart -- the moment a style change lands on one page only, switching
+#: pages jumps, which is the exact bug this fragment exists to prevent.
+_HEADER_CSS = """:root{
   --bg:#0b141a; --panel:#101e26; --panel2:#0d1a21; --line:#1d3440;
   --ink:#dcecf1; --dim:#7f9ba7; --teal:#5ed6cb; --amber:#f0b25e;
   --red:#e2685f; --green:#5cc98c;
@@ -316,14 +362,6 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
   display:flex;align-items:center;gap:11px}
 .mark{width:22px;height:22px;flex:none}
 .sub{margin:5px 0 20px;color:var(--dim);font-size:13px}
-.bar{display:flex;flex-wrap:wrap;gap:24px;align-items:center;
-  background:var(--panel);border:1px solid var(--line);border-radius:12px;
-  padding:12px 18px;margin-bottom:16px}
-.bit{display:flex;flex-direction:column;gap:1px;min-width:0}
-.bk{font-size:9.5px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
-.bv{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;
-  white-space:nowrap}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px}
 /* Two pages, one nav. It rides on the title line and both pages carry an
    identical header, so switching moves nothing on screen but the highlight. */
 .tabs{display:flex;border:1px solid var(--line);border-radius:8px;
@@ -333,8 +371,89 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .tabs a+a{border-left:1px solid var(--line)}
 .tabs a:hover{color:var(--ink)}
 .tabs a.on{color:var(--teal);background:var(--panel)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:7px}
 .dot.on{background:var(--green);box-shadow:0 0 0 3px rgba(92,201,140,.16)}
 .dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(226,104,95,.16)}
+.fname{font-family:var(--mono);font-size:13px;color:var(--dim);
+  margin-left:8px;font-weight:400}
+.tabsrow{display:flex;align-items:center;gap:16px;margin-top:10px}
+.tabsrow .peers{margin-left:auto}
+/* Peer pills: status dot + name (or ":PORT"), then a muted engine suffix. */
+.peers{display:flex;gap:6px;align-items:center}
+.peers a.lane{font-family:var(--mono);font-size:11px;color:var(--dim);
+  text-decoration:none;border:1px solid var(--line);border-radius:6px;
+  padding:2px 8px;display:inline-flex;align-items:center;gap:6px}
+.peers a.lane:hover{color:var(--teal);border-color:var(--teal)}
+.peers .pdot{width:6px;height:6px;border-radius:50%;display:inline-block}
+.peers .pdot.on{background:var(--green)}
+.peers .pdot.off{background:var(--red)}
+.peers .pfx{color:var(--dim);font-size:10px}
+/* GPU panel: one row per card, the matching lane marked. */
+.gpus{background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  overflow:hidden}
+.gpus table{width:100%;border-collapse:collapse}
+.gpus th{font-size:9.5px;letter-spacing:.1em;color:var(--dim);
+  text-transform:uppercase;font-weight:600;text-align:right;
+  padding:10px 16px 8px;border-bottom:1px solid var(--line)}
+.gpus th:first-child{text-align:left}
+.gpus td{font-family:var(--mono);font-size:13px;text-align:right;
+  padding:9px 16px;border-bottom:1px solid rgba(29,52,64,.5);
+  font-variant-numeric:tabular-nums}
+.gpus tr:last-child td{border-bottom:0}
+.gpus td:first-child{text-align:left;color:var(--dim);font-size:12px}
+.gpus tr.this td:first-child{color:var(--teal)}
+.gpus tr.this td:first-child::before{content:"\25B8 ";color:var(--teal)}
+.gpus .meter{height:4px;background:var(--panel2);border-radius:3px;
+  overflow:hidden;border:1px solid var(--line);margin-top:0;width:90px;
+  display:inline-block;vertical-align:middle;margin-left:8px}
+.gpus .meter i{display:block;height:100%;background:var(--teal);width:0;
+  transition:width .45s ease}
+.quiet{padding:16px;color:var(--dim);font-size:12px}
+"""
+
+#: The header markup, one function because the two pages differ in only two
+#: places: which tab carries the "on" class, and the page title. Everything
+#: else -- the mark, the lane name, the peer pills, the tabs themselves --
+#: is byte-identical on both pages.
+_HEADER_HTML = """<div class="head">
+<h1>
+<svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
+  <rect x="1.3" y="1.3" width="21.4" height="21.4" rx="5.8" fill="#0f1e26" stroke="#1d3440"/>
+  <path d="M5.6 12h12.2M13.3 7.8L18.1 12l-4.8 4.2" fill="none" stroke="#5ed6cb"
+        stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+<span>omp forwarder</span><span class="fname" id="fname"></span></h1>
+<div class="tabsrow">
+<nav class="tabs">{tabs}</nav>
+<div class="peers" id="peers"></div>
+</div>
+</div>"""
+
+_SVG_SYMBOLS = """<svg style="display:none">
+  <symbol id="ico-rst" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+          stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.6 4.2v5.2h-5.2"/>
+  </symbol>
+</svg>"""
+
+
+def header(on: str) -> str:
+    """The shared header: title, lane name, tab switch, peer pills.
+    `on` is the tab that is lit on this page ("stats" or "usage")."""
+    live = '<a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a>'
+    usage = '<a href="/__stats">Live</a><a class="on" href="/__usage">Usage</a>'
+    tabs = live if on == "stats" else usage
+    return _HEADER_HTML.format(tabs=tabs)
+
+
+PAGE = r"""<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title id="pg_title">omp forwarder</title>
+<style>
+__HEADER_CSS__
+
+
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:13px 16px 14px}
@@ -426,26 +545,9 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
 .pill.on{color:var(--green);border-color:var(--green)}
 .pill.off{color:var(--red);border-color:var(--red)}
 </style>
-<svg style="display:none">
-  <symbol id="ico-rst" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-          stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
-    <path d="M20.5 12a8.5 8.5 0 1 1-2.6-6.1"/><path d="M20.6 4.2v5.2h-5.2"/>
-  </symbol>
-</svg>
+__SVG_SYMBOLS__
 <div class="wrap">
-<div class="head">
-<h1>
-<svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
-  <rect x="1.3" y="1.3" width="21.4" height="21.4" rx="5.8" fill="#0f1e26" stroke="#1d3440"/>
-  <path d="M5.6 12h12.2M13.3 7.8L18.1 12l-4.8 4.2" fill="none" stroke="#5ed6cb"
-        stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>
-<span>omp forwarder</span><span class="fname" id="fname"></span></h1>
-<div class="tabsrow">
-<nav class="tabs"><a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a></nav>
-<div class="peers" id="peers"></div>
-</div>
-</div>
+__HEADER__
 <div class="sub">Traffic omp sends straight to llama-server &mdash; the requests Unsloth&rsquo;s own API panel cannot see.</div>
 
 <div class="bar">
@@ -505,6 +607,9 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
   <div class="card"><div class="k">Largest context</div>
     <div class="v" id="tmax">&mdash;</div><div class="n" id="tmax_n">tokens, high water</div></div>
 </div>
+
+<h2>GPUs &mdash; nvidia-smi<span class="rule"></span><span class="since" id="gpus_n"></span></h2>
+<div id="gpus" class="gpus"><div class="quiet">no GPU data</div></div>
 
 <h2>Per stream &mdash; <span id="slots_src">from /slots</span><span class="rule"></span>
   <span class="since" id="slots_n"></span></h2>
@@ -673,7 +778,22 @@ async function tick(){
 
   // --- model section: throughput, decode, prefill, draft ---
   const NP = "not provided by this upstream";
-  if(noMetrics){
+  if(engine==="sglang" && s.metrics_available){
+    // SGLang exposes different metric names; map onto the same cards.
+    // Throughput is a live gauge (tok/s), not a counter to difference.
+    $("tput").textContent=fmt(s.gen_throughput);
+    $("tput_n").textContent="live, from SGLang";
+    // Decode and Prefill are not separately exposed by SGLang.
+    $("dec").textContent="—"; $("dec_n").textContent=NP;
+    $("pre").textContent="—"; $("pre_n").textContent=NP;
+    // Draft acceptance: SGLang reports a length, not a percent.
+    // Show it as "tau 3.2" rather than as a percentage.
+    if(s.sglang_spec_accept_length>0){
+      $("acc").textContent="tau "+s.sglang_spec_accept_length.toFixed(1);
+      meterSet($("acc_m"),0,50,40);
+      $("acc_n").textContent="spec accept length";
+    } else { $("acc").textContent="—"; $("acc_n").textContent=NP; }
+  } else if(noMetrics){
     $("tput").textContent="—"; $("tput_n").textContent=NP;
     $("dec").textContent="—";  $("dec_n").textContent=NP;
     $("pre").textContent="—";  $("pre_n").textContent=NP;
@@ -729,7 +849,26 @@ async function tick(){
   }
 
   // --- server section: in flight, prompt cache, tokens per pass, largest ctx ---
-  if(noMetrics){
+  if(engine==="sglang" && s.metrics_available){
+    // SGLang maps onto the same cards, different numbers.
+    // In flight: running + queued requests, from SGLang's own counters.
+    $("inflight").textContent=s.sglang_running;
+    $("inflight_n").textContent = s.sglang_queued>0
+      ? (s.sglang_queued+" queued")
+      : (s.sglang_running>0?"busy":"idle");
+    // Prompt cache: SGLang's cache_hit_rate is a 0..1 ratio, shown as %.
+    const ch=100*(s.sglang_cache_hit_rate||0);
+    $("hit").textContent=ch.toFixed(1);
+    meterSet($("hit_m"),ch,60,35);
+    $("hit_n").textContent="prefix reused";
+    // Tokens per pass: not split per pass by SGLang; show the KV pool.
+    $("tpp").textContent="—"; $("tpp_n").textContent=NP;
+    // Largest context: SGLang's context_len, its own window, not a high-water.
+    $("tmax").textContent=Math.round(s.sglang_context_len).toLocaleString();
+    $("tmax_n").textContent = s.sglang_context_len>0
+      ? "window · KV "+Math.round(100*(s.sglang_token_usage||0))+"%"
+      : "tokens, high water";
+  } else if(noMetrics){
     $("inflight").textContent="—"; $("inflight_n").textContent=NP;
     $("hit").textContent="—";  $("hit_n").textContent=NP;
     meterSet($("hit_m"),0,60,35);
@@ -756,6 +895,28 @@ async function tick(){
     else { $("tpp").textContent="—"; $("tpp_n").textContent="no passes yet"; }
   }
 
+  // --- GPU panel: one row per card, this lane's card marked ---
+  const gbox=document.getElementById("gpus");
+  const gnote=document.getElementById("gpus_n");
+  if(s.gpus && s.gpus.length){
+    const thisGpu=s.gpu;
+    const rows=s.gpus.map(g=>{
+      const gis=thisGpu!=null&&g.index===thisGpu;
+      const mem=(g.mem_used_mib/1024).toFixed(1)+"/"+(g.mem_total_mib/1024).toFixed(1)+" GiB";
+      const utilPct=Math.min(100,g.util_pct);
+      return `<tr class="${gis?"this":""}"><td>gpu ${g.index} · ${g.name}</td>`
+        +`<td>${mem}</td>`
+        +`<td>${g.util_pct}%<span class="meter"><i style="width:${utilPct}%"></i></span></td></tr>`;
+    });
+    gbox.innerHTML="<table><thead><tr><th>card</th><th>memory</th><th>util</th></tr></thead><tbody>"
+      +rows.join("")+"</tbody></table>";
+    gnote.textContent=s.gpus.length+" card"+(s.gpus.length>1?"s":"");
+  } else {
+    gbox.innerHTML='<div class="quiet">no GPU data</div>';
+    gnote.textContent="";
+  }
+
+
   // --- per-stream table: render or show not-provided ---
   if(noMetrics){
     const box=document.getElementById("slots");
@@ -772,8 +933,19 @@ async function tick(){
     $("pg_title").textContent="omp forwarder"; }
   const pb=$("peers");
   if(s.peers && s.peers.length){
-    pb.innerHTML=s.peers.map(pp=>'<a class="lane" href="http://127.0.0.1:'+pp+'/__stats" target="_blank">lane :'+pp+'</a>').join("");
+    pb.innerHTML=s.peers.map(pp=>{
+      const name=pp.name?("lane "+pp.name):("lane :"+pp.port);
+      const fx=pp.reachable
+        ? ((pp.engine&&pp.engine!=="unknown"?" "+pp.engine:"")
+           +((pp.thinking&&pp.thinking!=="unknown")?(" · "+pp.thinking):""))
+        : " unreachable";
+      const dot=pp.healthy?"on":"off";
+      return `<a class="lane" href="http://127.0.0.1:${pp.port}/__stats" target="_blank">`
+        +`<span class="pdot ${dot}"></span><span>${name}</span>`
+        +`<span class="pfx">${fx}</span></a>`;
+    }).join("");
   } else { pb.innerHTML=""; }
+
 
   // --- deployment facts ---
   const F2=s.facts||{};
@@ -911,3 +1083,6 @@ document.querySelectorAll("#ctl button").forEach(btn=>{
 tick(); setInterval(tick,3000);
 </script>
 """
+PAGE = (PAGE.replace("__HEADER_CSS__", _HEADER_CSS)
+           .replace("__SVG_SYMBOLS__", _SVG_SYMBOLS)
+           .replace("__HEADER__", header("stats")))

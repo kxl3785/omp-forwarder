@@ -357,9 +357,24 @@ class LaneIdentityTests(ForwarderCase):
     def test_name_and_peers_in_snapshot(self):
         fwd.FWD_NAME = "lane-a"
         fwd.PEERS = [9890, 9891]
+        fwd._peer_state = {
+            9890: {"port": 9890, "name": "lane-b", "healthy": True,
+                   "engine": "sglang", "thinking": "on", "gpu": 0,
+                   "reachable": True},
+            9891: {"port": 9891, "name": "lane-c", "healthy": False,
+                   "engine": "llama-server", "thinking": "off", "gpu": 1,
+                   "reachable": False},
+        }
         d = stats.snapshot(fwd, fwd._stats)
         self.assertEqual(d["name"], "lane-a")
-        self.assertEqual(d["peers"], [9890, 9891])
+        self.assertEqual(d["peers"], [
+            {"port": 9890, "name": "lane-b", "healthy": True,
+             "engine": "sglang", "thinking": "on", "gpu": 0,
+             "reachable": True},
+            {"port": 9891, "name": "lane-c", "healthy": False,
+             "engine": "llama-server", "thinking": "off", "gpu": 1,
+             "reachable": False},
+        ])
 
     def test_name_and_peers_default_none(self):
         # reset_state set FWD_NAME to None, PEERS to []
@@ -369,10 +384,13 @@ class LaneIdentityTests(ForwarderCase):
 
     def test_peers_returns_a_copy(self):
         fwd.PEERS = [1]
+        fwd._peer_state = {1: {"port": 1, "name": "x", "healthy": True,
+                                "engine": "llama-server", "thinking": "on",
+                                "gpu": None, "reachable": True}}
         d = stats.snapshot(fwd, fwd._stats)
         d["peers"].append(99)
         self.assertEqual(fwd.PEERS, [1])
-
+        self.assertNotIn(99, fwd._peer_state)
 
 class MainFlagsTests(ForwarderCase):
     """main() sets FWD_NAME, PEERS, and _control_token from CLI args."""
@@ -419,3 +437,134 @@ class MainFlagsTests(ForwarderCase):
             fwd.main(["--upstream-port", str(free_port())])
             tok2 = fwd._control_token
         self.assertNotEqual(tok1, tok2)
+
+
+# ----------------------------------------------------------------
+# 5. Peer sampling: _sample_peers reads /__stats.json from each --peer
+# ----------------------------------------------------------------
+
+class PeerSamplingTests(ForwarderCase):
+    """_sample_peers: what ends up in _peer_state after a sample."""
+
+    def test_records_peer_facts(self):
+        fwd.PEERS = [9890]
+        fwd.LISTEN_PORT = 9888
+        peer_snapshot = {
+            "name": "lane-b", "healthy": True, "metrics_available": True,
+            "facts": {"engine": "sglang", "thinking": "on"},
+            "gpu": 0,
+        }
+        with mock.patch("omp_forwarder.stats._http_get_json",
+                       return_value=peer_snapshot) as m:
+            fwd._sample_peers()
+        self.assertIn(9890, fwd._peer_state)
+        p = fwd._peer_state[9890]
+        self.assertEqual(p["port"], 9890)
+        self.assertEqual(p["name"], "lane-b")
+        self.assertTrue(p["healthy"])
+        self.assertEqual(p["engine"], "sglang")
+        self.assertEqual(p["thinking"], "on")
+        self.assertEqual(p["gpu"], 0)
+        self.assertTrue(p["reachable"])
+
+    def test_unreachable_peer_keeps_last_known_name(self):
+        fwd.PEERS = [9890]
+        fwd.LISTEN_PORT = 9888
+        # First sample: reachable
+        with mock.patch("omp_forwarder.stats._http_get_json",
+                       return_value={"name": "lane-b", "healthy": True,
+                                     "facts": {"engine": "sglang",
+                                               "thinking": "on"},
+                                     "gpu": 0}):
+            fwd._sample_peers()
+        # Second sample: unreachable
+        with mock.patch("omp_forwarder.stats._http_get_json",
+                       return_value=None):
+            fwd._sample_peers()
+        p = fwd._peer_state[9890]
+        self.assertFalse(p["reachable"])
+        self.assertFalse(p["healthy"])
+        self.assertEqual(p["name"], "lane-b")
+
+    def test_skips_own_port(self):
+        fwd.PEERS = [9888]
+        fwd.LISTEN_PORT = 9888
+        with mock.patch("omp_forwarder.stats._http_get_json") as m:
+            fwd._sample_peers()
+        m.assert_not_called()
+
+
+# ----------------------------------------------------------------
+# 6. GPU sampling: _sample_gpus parses nvidia-smi into _gpu_state
+# ----------------------------------------------------------------
+
+class GpuSamplingTests(ForwarderCase):
+    """_sample_gpus: nvidia-smi output → _gpu_state list of dicts."""
+
+    def test_parses_nvidia_smi(self):
+        out = "0, NVIDIA H100 80GB HBM3, 42000, 81920, 75\n" \
+              "1, NVIDIA H100 80GB HBM3, 39000, 81920, 60\n"
+        with mock.patch("omp_forwarder.forwarder._run_host",
+                        return_value=_completed(out, 0)):
+            fwd._sample_gpus()
+        self.assertEqual(len(fwd._gpu_state), 2)
+        g0 = fwd._gpu_state[0]
+        self.assertEqual(g0["index"], 0)
+        self.assertEqual(g0["name"], "NVIDIA H100 80GB HBM3")
+        self.assertEqual(g0["mem_used_mib"], 42000)
+        self.assertEqual(g0["mem_total_mib"], 81920)
+        self.assertEqual(g0["util_pct"], 75)
+
+    def test_malformed_line_is_skipped(self):
+        out = "0, NVIDIA H100, notanumber, 81920, 75\n"
+        with mock.patch("omp_forwarder.forwarder._run_host",
+                        return_value=_completed(out, 0)):
+            fwd._sample_gpus()
+        self.assertEqual(fwd._gpu_state, [])
+
+    def test_failed_run_leaves_empty(self):
+        with mock.patch("omp_forwarder.forwarder._run_host",
+                        return_value=None):
+            fwd._sample_gpus()
+        self.assertEqual(fwd._gpu_state, [])
+
+    def test_snapshot_exposes_gpu_fields(self):
+        fwd.FWD_GPU = 0
+        fwd._gpu_state = [{"index": 0, "name": "NVIDIA H100",
+                           "mem_used_mib": 42000, "mem_total_mib": 81920,
+                           "util_pct": 75}]
+        d = stats.snapshot(fwd, fwd._stats)
+        self.assertEqual(d["gpu"], 0)
+        self.assertEqual(d["gpus"][0]["index"], 0)
+        self.assertEqual(d["gpus"][0]["util_pct"], 75)
+
+
+# ----------------------------------------------------------------
+# 7. Shared header: both pages use the same fragment
+# ----------------------------------------------------------------
+
+class SharedHeaderTests(ForwarderCase):
+    """The header fragment is present in both PAGE strings."""
+
+    def test_stats_page_contains_header_css(self):
+        # The CSS variables from the shared fragment are inlined into the page
+        # at module load; the placeholder token is gone after substitution.
+        self.assertNotIn("__HEADER_CSS__", stats.PAGE)
+        self.assertIn("--teal", stats.PAGE)
+        self.assertIn("var(--bg)", stats.PAGE)
+
+    def test_stats_page_contains_header_html(self):
+        self.assertIn('id="peers"', stats.PAGE)
+        self.assertIn('id="fname"', stats.PAGE)
+        self.assertIn('svg class="mark"', stats.PAGE)
+
+    def test_usage_page_contains_header_css(self):
+        from omp_forwarder import usage
+        self.assertNotIn("__HEADER_CSS__", usage.PAGE)
+        self.assertIn("--teal", usage.PAGE)
+        self.assertIn("var(--bg)", usage.PAGE)
+
+    def test_usage_page_contains_header_html(self):
+        from omp_forwarder import usage
+        self.assertIn('id="peers"', usage.PAGE)
+        self.assertIn('svg class="mark"', usage.PAGE)

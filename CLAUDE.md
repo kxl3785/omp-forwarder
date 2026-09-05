@@ -71,9 +71,20 @@ never on the request path. `/__control` is POST plus a launch-time token and
 there are no CORS headers anywhere — a foreign page cannot read
 `/__stats.json`, so it cannot learn the token, and GET never mutates. Routing
 reads only the first line and query string, so the relay still parses no
-bodies. Discovery cannot see a container (it matches by executable path), so
-a container upstream needs `--upstream-port`; `--name`/`--peer` exist so two
-lane dashboards tell each other apart.
+bodies. `--name`/`--peer` exist so two lane dashboards tell each other apart.
+
+**Discovery sees two kinds of upstream, and re-evaluates.** Executable
+matching cannot see a container, so candidates also come from
+`--candidate-port` and from `docker port <container>` in container mode; every
+candidate gets the same `/health` probe, and `--prefer` (default
+`llama-server`) decides when both kinds are healthy. The first version
+evaluated that preference once, at startup: in the live test a llama-server
+that appeared beside a healthy container was never noticed. The monitor thread
+now recomputes the choice every 10 s and switches *new* connections when a
+preferred healthy upstream exists; existing connections are never touched.
+`--upstream-port` still overrides all of it, and nothing falls back to :8888.
+For the dashboard's model cards on an SGLang lane, launch SGLang with
+`--enable-metrics`; without it `/metrics` is 404 and the cards say so.
 
 **Discovery cannot tell two `llama-server` processes apart by port.** It takes
 the highest healthy one. RadHelper runs its own 4B model on a llama-server,

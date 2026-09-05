@@ -113,7 +113,8 @@ itself. Make a desktop shortcut to that file and point the shortcut's icon at
 | `--wsl-distro NAME` | WSL distro that hosts the upstream Docker container (use with `--container`) |
 | `--container NAME` | Docker container name inside the distro (use with `--wsl-distro`) |
 | `--name TEXT` | human label for this forwarder, shown on the dashboard and in the page title |
-| `--peer PORT` | another forwarder on this machine; rendered as a link in the dashboard header; repeatable |
+| `--peer PORT` | another forwarder on this machine; rendered as a status pill in the dashboard header; repeatable |
+| `--gpu N` | index of the GPU this lane's model server runs on; marks that card in the dashboard's GPU panel |
 
 ## Container-upstream mode
 
@@ -172,7 +173,7 @@ container mode is on.
 
 ## Dashboard control surface
 
-When running two forwarders side by side (one per GPU, for example), four
+When running two forwarders side by side (one per GPU, for example), six
 features make the `/__stats` page a truthful control surface rather than a
 bag of zeros:
 
@@ -199,9 +200,32 @@ bag of zeros:
   can never mutate.
 
 - **Lane identity.** `--name` sets a human label shown in the page title and
-  header. `--peer` (repeatable) renders links to other forwarders on the
-  same machine, so you can switch between two side-by-side deployments
-  without losing your place.
+  header. `--peer` (repeatable) renders a status pill for each peer forwarder:
+  a green/red dot, the peer's name (or `:PORT`), and a muted engine +
+  thinking suffix. The pill links to that peer's `/__stats` page, so you can
+  switch between two side-by-side deployments without losing your place. A
+  forwarder never lists itself.
+
+- **GPU panel.** `--gpu N` declares which GPU this lane runs on. The
+  dashboard's GPU panel (backed by a 10-second `nvidia-smi` sample) shows one
+  row per card: memory used/total in GiB and a utilisation meter. The card
+  matching `--gpu` is highlighted with a teal prefix marker. A two-GPU box
+  running two forwarders shows both cards in both dashboards, so you can see
+  at a glance which lane owns which GPU and how loaded each one is.
+
+- **SGLang support.** When the upstream is SGLang (detected via
+  `/get_server_info`), the dashboard's server cards read SGLang's own
+  `/metrics` counters instead of `llama-server`'s: `sglang:gen_throughput`
+  drives the Throughput card directly (it is a live gauge, not a cumulative
+  counter), `sglang:num_running_reqs` + `sglang:num_queue_reqs` drive the
+  In-flight card, `sglang:cache_hit_rate` drives the Prompt-cache card as a
+  percentage, and `sglang:spec_accept_length` shows as "tau X.X" in the
+  Draft-acceptance card. Decode/Prefill split and Per-stream remain "not
+  provided by this upstream" — SGLang does not expose per-request slots.
+  SGLang's `sglang:prompt_tokens_total` and `sglang:generation_tokens_total`
+  are folded into the forwarder's own token tally the same way
+  `llama-server`'s are, so the usage page works for both engines.
+
 
 ## The live dashboard
 

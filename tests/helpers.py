@@ -115,6 +115,10 @@ def reset_state() -> None:
     # Lane identity: --name and --peer flags.
     fwd.FWD_NAME = None
     fwd.PEERS = []
+    fwd.FWD_GPU = None
+    # Per-peer and GPU sampler state.
+    fwd._peer_state = {}
+    fwd._gpu_state = []
 
 
 class FakeUpstream:

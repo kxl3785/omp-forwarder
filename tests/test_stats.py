@@ -36,6 +36,58 @@ class ParseMetricsTests(ForwarderCase):
         self.assertEqual(stats.parse_metrics(""), {})
 
 
+
+SGLANG_METRICS = """\
+sglang:num_running_reqs{model="qwen"} 2
+sglang:num_running_reqs{model="qwen",rank="0"} 3
+sglang:gen_throughput{model="qwen"} 41.5
+sglang:cache_hit_rate 0.62
+sglang:spec_accept_length 2.7
+sglang:context_len 32768
+sglang:token_usage 0.45
+sglang:prompt_tokens_total 1000000
+sglang:generation_tokens_total 200000
+sglang:num_requests_total 55
+# HELP sglang:num_running_reqs ...
+# TYPE sglang:num_running_reqs gauge
+"""
+
+
+class ParseSGLangMetricsTests(ForwarderCase):
+    """parse_metrics handles SGLang's labelled, multi-rank Prometheus output."""
+
+    def test_strips_label_blocks(self):
+        d = stats.parse_metrics(SGLANG_METRICS)
+        # The {model=...} block is dropped; the name is the key.
+        self.assertEqual(d["sglang:gen_throughput"], 41.5)
+        self.assertEqual(d["sglang:cache_hit_rate"], 0.62)
+
+    def test_sums_duplicates_across_label_sets(self):
+        d = stats.parse_metrics(SGLANG_METRICS)
+        # num_running_reqs appears once per rank (2 + 3 = 5).
+        self.assertEqual(d["sglang:num_running_reqs"], 5.0)
+
+    def test_skips_help_and_type_comments(self):
+        d = stats.parse_metrics(SGLANG_METRICS)
+        self.assertNotIn("sglang:num_running_reqs_help", d)
+
+    def test_snapshot_carries_sglang_fields(self):
+        # Patch the /metrics reader so the snapshot picks up SGLang values.
+        import unittest.mock as mock
+        sgl = stats.parse_metrics(SGLANG_METRICS)
+        with mock.patch.object(stats, "upstream_metrics",
+                              return_value=sgl):
+            d = stats.snapshot(fwd, fwd._stats)
+        self.assertEqual(d["sglang_running"], 5.0)
+        self.assertEqual(d["gen_throughput"], 41.5)
+        self.assertEqual(d["sglang_cache_hit_rate"], 0.62)
+        self.assertEqual(d["sglang_spec_accept_length"], 2.7)
+        self.assertEqual(d["sglang_context_len"], 32768.0)
+        self.assertEqual(d["sglang_token_usage"], 0.45)
+        self.assertEqual(d["sglang_prompt_tokens"], 1000000.0)
+        self.assertEqual(d["sglang_gen_tokens"], 200000.0)
+
+
 class UpstreamReadersTests(ForwarderCase):
 
     def test_metrics_from_a_live_upstream(self):

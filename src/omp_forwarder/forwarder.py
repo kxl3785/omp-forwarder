@@ -72,6 +72,11 @@ FWD_NAME: str | None = None
 #: Ports of other forwarders on this machine (from --peer, repeatable).
 #: Rendered as links in the dashboard header; never probed.
 PEERS: list[int] = []
+#: GPU index this lane's model server runs on, from --gpu. The operator
+#: declares it: no server exposes it, so the dashboard's GPU panel cannot
+#: infer it either. None when unset.
+FWD_GPU: int | None = None
+
 
 #: Container-upstream mode, enabled when both --wsl-distro and --container are
 #: given. WSL_DISTRO hosts a Docker container that runs the model server;
@@ -131,10 +136,16 @@ _stats: dict = {"conns": 0, "requests": 0, "2xx": 0, "4xx": 0, "5xx": 0,
                 "fallbacks": 0, "unavailable": 0, "latency": [], "model": "",
                 "tok_prompt": 0, "tok_cached": 0, "tok_gen": 0,
                 "started": time.time()}
+#: Per-peer state, refreshed by the monitor thread: {port: {port, name,
+#: healthy, engine, thinking, gpu, reachable}}. Exposed in snapshot() as the
+#: `peers` list; snapshot filters out this forwarder's own port.
+_peer_state: dict[int, dict] = {}
+#: GPU rows from nvidia-smi, refreshed by the monitor thread. Empty when
+#: nvidia-smi is missing or fails; the panel then says "no GPU data".
+_gpu_state: list[dict] = []
 
 #: The /metrics sample the token tally was last folded from, as
-#: (port, prompt_tokens_total, prompt_tokens_cached_total,
-#: tokens_predicted_total). See _tally_tokens.
+#: (port, prompt_total, cached_total, gen_total). See _tally_tokens.
 _tok_last: tuple[int, float, float, float] | None = None
 _tok_lock = threading.Lock()
 #: Set when a relayed request completes; the sampler thread waits on it.
@@ -241,6 +252,19 @@ def _run_wsl(args: list[str], timeout: float = 10.0):
                               timeout=timeout)
     except Exception:
         return None
+
+
+def _run_host(args: list[str], timeout: float = 10.0):
+    """Host-side subprocess seam: runs a bare command on the host (nvidia-smi
+    and friends) rather than inside a WSL distro. Tests replace this with
+    recorded output, exactly as they replace _run_wsl. The timeout matters:
+    the monitor thread must never stall on a hung query."""
+    try:
+        return subprocess.run(args, capture_output=True, text=True,
+                              timeout=timeout)
+    except Exception:
+        return None
+
 
 def _spawn_wsl(args: list[str]) -> subprocess.Popen:
     """Long-lived child (the keepalive). Separate from _run_wsl because
@@ -390,16 +414,108 @@ def _sample_upstream_facts() -> None:
 
 
 
+def _sample_peers() -> None:
+    """Read each --peer's /__stats.json and remember it in _peer_state.
+    Runs on the sampler thread; the dashboard poll only copies the result.
+
+    A browser cannot read a peer at all -- no CORS, and none may be added --
+    so the forwarder does the read and publishes it: the pill on this page
+    is the only place a peer's name or health shows. GETs go through the
+    same replaceable HTTP function the facts panel uses, so tests record
+    the answers instead of opening connections. 2 s: the monitor owns the
+    whole 10 s cadence, so one slow peer must not stretch it."""
+    global _peer_state
+    from . import stats as stats_mod
+    seen: set[int] = set()
+    for port in PEERS:
+        if port == LISTEN_PORT:
+            continue  # a forwarder never lists itself
+        d = stats_mod._http_get_json(port, "/__stats.json", timeout=2)
+        if isinstance(d, dict):
+            facts = d.get("facts") or {}
+            _peer_state[port] = {
+                "port": port,
+                "name": d.get("name"),
+                "healthy": bool(d.get("healthy")),
+                "engine": facts.get("engine", "unknown"),
+                "thinking": facts.get("thinking", "unknown"),
+                "gpu": d.get("gpu"),
+                "reachable": True,
+            }
+            seen.add(port)
+        else:
+            # Dead port: keep the last shape but say the read failed. The
+            # name/engine/thinking/gpu fields then render grey, which is
+            # the honest reading of "we do not know".
+            prev = _peer_state.get(port)
+            _peer_state[port] = {
+                "port": port,
+                "name": prev["name"] if prev else None,
+                "healthy": False,
+                "engine": prev["engine"] if prev else "unknown",
+                "thinking": prev["thinking"] if prev else "unknown",
+                "gpu": prev["gpu"] if prev else None,
+                "reachable": False,
+            }
+    # Ports no longer in --peer must not keep serving stale state.
+    for p in list(_peer_state):
+        if p not in seen and p not in PEERS:
+            del _peer_state[p]
+
+
+def _sample_gpus() -> None:
+    """Run nvidia-smi once and parse it into _gpu_state. Runs on the
+    sampler thread; the dashboard poll only copies the list.
+
+    The query asks for MiB and integer percentages so the panel can show
+    GiB to one decimal without floating-point drift in the source. A
+    missing binary or a failed run leaves the list empty and the panel
+    says "no GPU data" -- there is no second source to fall back on,
+    and a half-parsed card would read as a number rather than as
+    "nothing"."""
+    global _gpu_state
+    res = _run_host(["nvidia-smi",
+                    "--query-gpu=index,name,memory.used,memory.total,"
+                    "utilization.gpu",
+                    "--format=csv,noheader,nounits"],
+                   timeout=5)
+    if res is None or res.returncode != 0 or not res.stdout:
+        _gpu_state = []
+        return
+    out: list[dict] = []
+    for line in res.stdout.strip().splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        # Five fields, all numeric except the name. A malformed line is
+        # skipped rather than guessed: a half-parsed card would read as a
+        # number.
+        if len(parts) != 5:
+            continue
+        try:
+            out.append({
+                "index": int(parts[0]),
+                "name": parts[1],
+                "mem_used_mib": int(parts[2]),
+                "mem_total_mib": int(parts[3]),
+                "util_pct": int(parts[4]),
+            })
+        except ValueError:
+            continue
+    _gpu_state = out
+
+
 def _upstream_sampler() -> None:
     """Background thread: probes /health and reads the deployment facts every
     10 s so the dashboard's status light and Deployment panel are truthful
     without paying for them on the request path. Started unconditionally,
     alongside the token sampler, so non-container deployments get the fields
-    too."""
+    too. Peers and GPUs ride the same cadence: they are all "background
+    truth" the request path must not pay for."""
     while True:
         time.sleep(10)
         _sample_health()
         _sample_upstream_facts()
+        _sample_peers()
+        _sample_gpus()
 
 
 def _exe_path(pid: str | int) -> str | None:
@@ -662,9 +778,18 @@ def _tally_tokens(port: int | None, metrics: dict,
     global _tok_last, _last_day, _days_dirty
     if not port or not metrics:
         return
-    prompt = metrics.get("llamacpp:prompt_tokens_total", 0.0)
-    cached = metrics.get("llamacpp:prompt_tokens_cached_total", 0.0)
-    gen = metrics.get("llamacpp:tokens_predicted_total", 0.0)
+    # llama-server's counters when the engine is llama-server; SGLang's when
+    # it is. The two sets never appear together, so picking the right one by
+    # presence is safe: a sample with neither set contributes nothing.
+    if "sglang:prompt_tokens_total" in metrics or \
+       "sglang:generation_tokens_total" in metrics:
+        prompt = metrics.get("sglang:prompt_tokens_total", 0.0)
+        cached = 0.0  # SGLang does not split prompt vs cached; it is one counter
+        gen = metrics.get("sglang:generation_tokens_total", 0.0)
+    else:
+        prompt = metrics.get("llamacpp:prompt_tokens_total", 0.0)
+        cached = metrics.get("llamacpp:prompt_tokens_cached_total", 0.0)
+        gen = metrics.get("llamacpp:tokens_predicted_total", 0.0)
     with _tok_lock:
         last = _tok_last
         _tok_last = (port, prompt, cached, gen)
@@ -1132,6 +1257,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="another forwarder on this machine; rendered as a "
                         "link in the dashboard header. Repeatable. Links only; "
                         "peers are never probed.")
+    p.add_argument("--gpu", type=int, default=None, metavar="N",
+                   help="index of the GPU this lane's model server runs on. "
+                        "A label: no server exposes it, so the dashboard's "
+                        "GPU panel marks the matching card as this lane.")
     return p.parse_args(argv)
 
 
@@ -1159,7 +1288,7 @@ def main(argv: list[str] | None = None) -> int:
     global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME
     global CANDIDATE_PORTS, PREFER
     global _container_status, _container_last_start
-    global FWD_NAME, PEERS, _control_token
+    global FWD_NAME, PEERS, FWD_GPU, _control_token
     args = _parse_args(argv)
 
     # Validate the two container flags: both or neither.
@@ -1174,7 +1303,11 @@ def main(argv: list[str] | None = None) -> int:
     WSL_DISTRO = args.wsl_distro
     CONTAINER_NAME = args.container
     FWD_NAME = args.name
+    FWD_GPU = args.gpu
     PEERS = list(args.peer)
+    # A new process: any peer/GPU state is stale and must not survive.
+    _peer_state.clear()
+    _gpu_state.clear()
     # One token for the lifetime of this process: the /__control endpoint
     # checks it, and the dashboard learns it from /__stats.json.
     _control_token = secrets.token_hex(16)

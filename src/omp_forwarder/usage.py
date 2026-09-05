@@ -22,17 +22,15 @@ second endpoint to keep in step.
 """
 from __future__ import annotations
 
+from omp_forwarder.stats import _HEADER_CSS, _SVG_SYMBOLS, header as _header_html
+
 PAGE = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>omp forwarder &mdash; usage</title>
 <style>
-:root{
-  --bg:#0b141a; --panel:#101e26; --panel2:#0d1a21; --line:#1d3440;
-  --ink:#dcecf1; --dim:#7f9ba7; --teal:#5ed6cb; --amber:#f0b25e;
-  --red:#e2685f; --green:#5cc98c;
-  --mono:ui-monospace,"Cascadia Mono","SF Mono",Menlo,Consolas,monospace;
-}
+__HEADER_CSS__
+
 *{box-sizing:border-box}
 /* Reserve the scrollbar even when the page is short, so switching
    between the two pages cannot shift the layout sideways. */
@@ -108,17 +106,9 @@ tr.na td{color:var(--dim)}
 .quiet{color:var(--dim);font-size:12.5px;padding:12px 0}
 body.stale .wrap{opacity:.45;transition:opacity .3s}
 </style>
+__SVG_SYMBOLS__
 <div class="wrap">
-<div class="head">
-<h1>
-<svg class="mark" viewBox="0 0 24 24" aria-hidden="true">
-  <rect x="1.3" y="1.3" width="21.4" height="21.4" rx="5.8" fill="#0f1e26" stroke="#1d3440"/>
-  <path d="M5.6 12h12.2M13.3 7.8L18.1 12l-4.8 4.2" fill="none" stroke="#5ed6cb"
-        stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
-</svg>
-omp forwarder</h1>
-<nav class="tabs"><a href="/__stats">Live</a><a class="on" href="/__usage">Usage</a></nav>
-</div>
+__HEADER__
 <div class="sub">What the local model did instead of a paid API &mdash; the tokens you did not buy.</div>
 
 <h2>Today<span class="rule"></span><span class="note" id="day"></span></h2>
@@ -296,3 +286,7 @@ async function tick(){
 tick(); setInterval(tick,5000);
 </script>
 """
+
+PAGE = (PAGE.replace("__HEADER_CSS__", _HEADER_CSS)
+            .replace("__SVG_SYMBOLS__", _SVG_SYMBOLS)
+            .replace("__HEADER__", _header_html("usage")))
