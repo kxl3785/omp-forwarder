@@ -285,6 +285,14 @@ def snapshot(fwd, stats: dict) -> dict:
         # True when --upstream-cmd was given, so start/restart exist on a
         # process lane; without it only stop is offered.
         "upstream_cmd": bool(getattr(fwd, "UPSTREAM_CMD", None)),
+        # Model presets this lane can assign to its GPU, and the current one.
+        # "loading" is a preset assigned but not yet healthy and not stopped:
+        # the page shows the wait instead of a red light that looks broken.
+        "presets": sorted(getattr(fwd, "_presets", {}) or {}),
+        "preset": getattr(fwd, "_preset", None),
+        "loading": bool(getattr(fwd, "_preset", None)
+                        and not getattr(fwd, "_upstream_healthy", False)
+                        and not getattr(fwd, "_operator_stopped", False)),
         # --- forwarder-only: /metrics has no error counter ---
         "conns": stats.get("conns", 0),
         "requests": stats.get("requests", 0),
@@ -587,6 +595,7 @@ __HEADER__
   <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
   <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
   <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
+  <div class="row full" id="modelrow" hidden><span class="fk">Model</span><span class="fv" id="f_preset">&mdash;</span><span class="ctl" id="presetctl"></span><span class="ctl_msg"></span></div>
   <div class="row full"><span class="fk">Upstream</span><span class="fv dim" id="f_up" title="How the current upstream was found; the configured preference">&mdash;</span></div>
 </div>
 
@@ -1008,6 +1017,27 @@ async function tick(){
   }
   setF("f_spec", F2.speculative==="none"?"none":(F2.speculative||"unknown"));
   setF("f_par", F2.parallel);
+  // Model presets: one button per recipe the operator may put on this GPU,
+  // plus unload. Buttons are built once from the preset list and only
+  // their disabled state changes afterwards, so a click never lands on a
+  // freshly re-rendered element.
+  const mr=$("modelrow"), pc=$("presetctl");
+  const presets=s.presets||[];
+  mr.hidden=!presets.length;
+  if(presets.length){
+    if(pc.dataset.built!==presets.join("|")){
+      pc.innerHTML=presets.map(p=>'<button data-act="assign" data-preset="'+p+'">'+p+'</button>').join("")
+        +'<button data-act="stop" class="danger">unload</button>';
+      pc.dataset.built=presets.join("|");
+      wireCtl(pc);
+    }
+    const cur=s.preset?(s.preset+(s.loading?" · loading…":(s.operator_stopped?" · unloaded":" · serving"))):"none assigned";
+    $("f_preset").textContent=cur;
+    pc.querySelectorAll("button").forEach(b=>{
+      b.disabled=!!s.loading;
+      if(b.dataset.act==="assign") b.classList.toggle("on", b.dataset.preset===s.preset && !s.operator_stopped);
+    });
+  }
   setF("f_model", F2.model_path);
   const kaEl=$("f_ka");
   if(s.keepalive_pid){ kaEl.textContent=s.keepalive_pid; kaEl.classList.remove("dim"); }
@@ -1109,25 +1139,30 @@ function renderSlots(s){
 }
 // Control buttons: POST to /__control with the token from the last sample.
 let _ctrlToken="";
-document.querySelectorAll(".ctl button").forEach(btn=>{
-  btn.addEventListener("click",async ()=>{
-    if(!_ctrlToken) return;
-    const act=btn.dataset.act;
-    // Scope the disable and the message to this bit: the Container and the
-    // Upstream-process bits each carry their own button group.
-    const bit=btn.closest(".bit"), msg=bit.querySelector(".ctl_msg");
-    if(act!=="start" && !confirm(act+" the upstream? This frees its GPU.")) return;
-    bit.querySelectorAll("button").forEach(b=>b.disabled=true);
-    try{
-      const r=await fetch("/__control?token="+encodeURIComponent(_ctrlToken)
-        +"&action="+act,{method:"POST",cache:"no-store"});
-      const j=await r.json();
-      msg.textContent=j.status?("-> "+j.status):(j.error||"");
-    }catch(e){ msg.textContent="request failed"; }
-    setTimeout(()=>{ msg.textContent="";
-      bit.querySelectorAll("button").forEach(b=>b.disabled=false); },3000);
+function wireCtl(root){
+  root.querySelectorAll("button").forEach(btn=>{
+    if(btn.dataset.wired) return; btn.dataset.wired="1";
+    btn.addEventListener("click",async ()=>{
+      if(!_ctrlToken) return;
+      const act=btn.dataset.act, preset=btn.dataset.preset;
+      // Scope the disable and the message to this group: the Container bit,
+      // the Upstream-process bit and the Model row each carry their own.
+      const grp=btn.closest(".bit")||btn.closest(".row"), msg=grp.querySelector(".ctl_msg");
+      const q=act==="assign"?("assign "+preset+" to this GPU? Whatever it fronts now is unloaded first."):(act+" the upstream? This frees its GPU.");
+      if(act!=="start" && !confirm(q)) return;
+      grp.querySelectorAll("button").forEach(b=>b.disabled=true);
+      try{
+        const r=await fetch("/__control?token="+encodeURIComponent(_ctrlToken)
+          +"&action="+act+(preset?("&preset="+encodeURIComponent(preset)):""),{method:"POST",cache:"no-store"});
+        const j=await r.json();
+        msg.textContent=j.status?("-> "+j.status+(j.port?(" on :"+j.port):"")):(j.error||"");
+      }catch(e){ msg.textContent="request failed"; }
+      setTimeout(()=>{ msg.textContent="";
+        grp.querySelectorAll("button").forEach(b=>b.disabled=false); },3000);
+    });
   });
-});
+}
+document.querySelectorAll(".ctl").forEach(wireCtl);
 tick(); setInterval(tick,3000);
 </script>
 """

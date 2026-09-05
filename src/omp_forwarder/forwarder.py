@@ -89,6 +89,29 @@ UPSTREAM_CMD: str | None = None
 _operator_stopped: bool = False
 #: The process started by --upstream-cmd, if any, so it is not orphaned.
 _upstream_child: subprocess.Popen | None = None
+#: Model presets: named launch recipes an operator can assign to this lane's
+#: GPU from the dashboard (from --presets, default presets.json beside
+#: tokens.json). A preset is {"kind": "process"|"container", "port": int or
+#: a "{gpu}" template, and for process "cmd", for container "distro",
+#: "container" (name template) and "run" (a docker run line)}. Templates
+#: take {gpu}, {port} and {name}. Reserved for launch recipes that have been
+#: measured; the seed file holds the two that won on 2026-09-05.
+PRESETS_FILE: str | None = None
+_presets: dict = {}
+#: The preset this lane currently fronts, or None. Persisted with the latch.
+_preset: str | None = None
+#: The container monitor thread runs at most once per process. A lane that
+#: starts without --container and later assigns a container preset needs it
+#: started on demand, or the dashboard reads "unknown" for a running container.
+_container_monitor_started: bool = False
+
+
+def _ensure_container_monitor() -> None:
+    global _container_monitor_started
+    if _container_monitor_started:
+        return
+    _container_monitor_started = True
+    threading.Thread(target=_container_monitor, daemon=True).start()
 
 
 #: Container-upstream mode, enabled when both --wsl-distro and --container are
@@ -976,28 +999,37 @@ def _upstream_pid() -> str | None:
 
 
 def _latch_path() -> str | None:
-    """Where the operator's stop is remembered: beside tokens.json, one file
-    per listen port so two lanes on one machine do not share a latch."""
+    """Where this lane's operator state is remembered: beside tokens.json,
+    one file per listen port so two lanes on one machine do not share it."""
     if not TOKENS_FILE:
         return None
     return os.path.join(os.path.dirname(TOKENS_FILE),
                         f"control-{LISTEN_PORT}.json")
 
 
+#: What _load_latch found on disk, for main() to adopt: a preset assigned in
+#: an earlier run of this lane, with the port and container it launched.
+_saved_state: dict = {}
+
+
 def _load_latch() -> None:
-    """Restore _operator_stopped from disk at startup. The latch used to live
-    only in memory, so restarting the forwarder forgot the operator's stop
-    and the container monitor reloaded the GPU within a minute. An unload
-    must outlive the process that performed it."""
-    global _operator_stopped
+    """Restore the operator's stop and the lane's assignment from disk at
+    startup. The latch used to live only in memory, so restarting the
+    forwarder forgot the operator's stop and the container monitor reloaded
+    the GPU within a minute. An unload -- and an assignment -- must outlive
+    the process that performed it."""
+    global _operator_stopped, _preset, _saved_state
     path = _latch_path()
     if not path:
         return
     try:
         with open(path, encoding="utf-8") as fh:
-            _operator_stopped = bool(json.load(fh).get("operator_stopped"))
+            d = json.load(fh)
     except (OSError, ValueError):
-        _operator_stopped = False
+        d = {}
+    _operator_stopped = bool(d.get("operator_stopped"))
+    _preset = d.get("preset") or None
+    _saved_state = dict(d)
 
 
 def _save_latch() -> None:
@@ -1008,10 +1040,131 @@ def _save_latch() -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         tmp = path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"operator_stopped": _operator_stopped}, fh)
+            json.dump({"operator_stopped": _operator_stopped,
+                       "preset": _preset,
+                       "upstream_port": FORCED_UPSTREAM,
+                       "distro": WSL_DISTRO,
+                       "container": CONTAINER_NAME}, fh)
         os.replace(tmp, path)
     except OSError as exc:
         log(f"cannot write {path}: {exc!r}")
+
+
+def _presets_path() -> str | None:
+    if PRESETS_FILE:
+        return PRESETS_FILE
+    if not TOKENS_FILE:
+        return None
+    return os.path.join(os.path.dirname(TOKENS_FILE), "presets.json")
+
+
+def _load_presets() -> None:
+    """Read the presets file into _presets. Missing or malformed means no
+    presets: the Model row then shows nothing and assign answers 404."""
+    global _presets
+    path = _presets_path()
+    if not path:
+        _presets = {}
+        return
+    try:
+        with open(path, encoding="utf-8") as fh:
+            d = json.load(fh)
+        _presets = {k: v for k, v in d.items()
+                    if isinstance(v, dict) and v.get("kind") in ("process", "container")}
+    except (OSError, ValueError) as exc:
+        log(f"presets unreadable at {path}: {exc!r}")
+        _presets = {}
+
+
+def _render(template, gpu: int, port: int | None = None, name: str = "") -> str:
+    """Fill {gpu}, {port} and {name} in a preset template. str.replace, not
+    str.format: a docker run line carries JSON braces of its own."""
+    s = str(template)
+    s = s.replace("{gpu}", str(gpu))
+    if port is not None:
+        s = s.replace("{port}", str(port))
+    return s.replace("{name}", name)
+
+
+def _preset_port(p: dict, gpu: int) -> int:
+    return int(_render(p.get("port", 0), gpu))
+
+
+def _unload_current(timeout: float = 30.0) -> None:
+    """Stop whatever this lane fronts, container or process, and drop the
+    container-mode globals so the next assignment starts clean."""
+    global WSL_DISTRO, CONTAINER_NAME, _container_status
+    if WSL_DISTRO and CONTAINER_NAME:
+        _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+                  "docker", "stop", CONTAINER_NAME], timeout=timeout)
+        _container_keepalive_stop()
+        WSL_DISTRO, CONTAINER_NAME, _container_status = None, None, None
+        return
+    pid = _upstream_pid()
+    if pid is None:
+        _refresh_upstream_pid()
+        pid = _upstream_pid()
+    if pid is not None:
+        if os.name == "nt":
+            _run_host(["taskkill", "/PID", str(pid), "/F"], timeout=timeout)
+        else:
+            _run_host(["kill", str(pid)], timeout=timeout)
+
+
+def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
+    """Put preset `name` on this lane's GPU: unload what is there, launch the
+    recipe with {gpu}/{port}/{name} filled, point the lane's upstream at the
+    new port and let the existing wait-then-503 path cover the load. Returns
+    (status, port). Statuses: "loading", "no-gpu", "unknown-preset".
+
+    The lane's GPU comes from --gpu; a preset never chooses a card. Two
+    lanes therefore give every arrangement: tune on one card and SGLang on
+    the other, the reverse, or the same recipe on both."""
+    global FORCED_UPSTREAM, _upstream, _upstream_kind, _upstream_exe, _upstream_healthy
+    global WSL_DISTRO, CONTAINER_NAME, _operator_stopped, _preset, _upstream_child
+    if FWD_GPU is None:
+        return "no-gpu", None
+    p = _presets.get(name)
+    if not p:
+        return "unknown-preset", None
+    gpu = int(FWD_GPU)
+    port = _preset_port(p, gpu)
+    _unload_current()
+    if p["kind"] == "process":
+        _upstream_child = _spawn_host(
+            shlex.split(_render(p["cmd"], gpu, port), posix=(os.name != "nt")))
+    else:
+        cname = _render(p.get("container", "lane{gpu}"), gpu, port)
+        distro = p["distro"]
+        run = _render(p["run"], gpu, port, cname)
+        # A stale container of the same name would make docker run fail.
+        _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--",
+                  "docker", "rm", "-f", cname], timeout=timeout)
+        _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--", "bash", "-c", run],
+                 timeout=timeout)
+        WSL_DISTRO, CONTAINER_NAME = distro, cname
+        _container_keepalive_start()
+        # Show a status at once and keep it live: a lane that started as a
+        # process lane has no container monitor yet.
+        _poll_container_status(auto_start=False)
+        _container_port_from_docker()
+        _ensure_container_monitor()
+    with _lock:
+        # Point the lane at the new port now, as a static --upstream-port
+        # lane would be. Clearing _upstream and leaving discover() to re-adopt
+        # the forced port looked cleaner and was wrong: discover() runs on a
+        # request, so until a client arrived the health sampler probed
+        # nothing, the page read "loading" through a served completion, and
+        # stop found no PID to kill because the lookup keys on _upstream.
+        FORCED_UPSTREAM = port
+        _upstream, _upstream_kind, _upstream_exe = port, "explicit", None
+        _upstream_healthy = False
+        _stats["model"] = ""
+    _operator_stopped = False
+    _preset = name
+    _save_latch()
+    log(f"assigned preset {name} to gpu {gpu} on port {port}")
+    return "loading", port
 
 
 def _port_pid(port: int | None) -> str | None:
@@ -1079,6 +1232,13 @@ def _control_action(action: str, timeout: float = 30.0) -> str:
     if action in ("stop", "restart"):
         pid = _upstream_pid()
         if pid is None:
+            # Right after an assign the sampler has not yet mapped the new
+            # port to its owner (it runs every 10 s). One netstat pass here
+            # keeps stop honest instead of answering "no-process" over a
+            # loaded card.
+            _refresh_upstream_pid()
+            pid = _upstream_pid()
+        if pid is None:
             return "no-process"
         if os.name == "nt":
             _run_host(["taskkill", "/PID", str(pid), "/F"], timeout=timeout)
@@ -1137,9 +1297,9 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
     if not (WSL_DISTRO and CONTAINER_NAME) and _upstream_pid() is None:
         _refresh_upstream_pid()
     # Nothing to control: no container, no process behind the upstream port,
-    # and no command that could start one.
+    # no command that could start one, and no presets to assign.
     if not ((WSL_DISTRO and CONTAINER_NAME) or _upstream_pid()
-            or UPSTREAM_CMD):
+            or UPSTREAM_CMD or _presets):
         reply("404 Not Found", {"ok": False, "error": "nothing to control"})
         return
     # Only POST mutates; a GET can never do anything.
@@ -1149,6 +1309,21 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
         return
     if token != _control_token:
         reply("403 Forbidden", {"ok": False, "error": "bad token"})
+        return
+    if action == "assign":
+        preset = (params.get("preset") or [""])[0]
+        status, port = _assign_preset(preset)
+        if status == "no-gpu":
+            reply("409 Conflict", {"ok": False, "action": action,
+                                   "error": "this lane has no --gpu; a preset "
+                                            "needs a card to land on"})
+        elif status == "unknown-preset":
+            reply("400 Bad Request", {"ok": False, "action": action,
+                                      "error": "unknown preset",
+                                      "presets": sorted(_presets)})
+        else:
+            reply("200 OK", {"ok": True, "action": action, "status": status,
+                             "preset": preset, "port": port})
         return
     if action not in ("start", "stop", "restart"):
         reply("400 Bad Request", {"ok": False, "error": "unknown action"})
@@ -1435,6 +1610,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="another forwarder on this machine; rendered as a "
                         "link in the dashboard header. Repeatable. Links only; "
                         "peers are never probed.")
+    p.add_argument("--presets", default=None, metavar="FILE",
+                   help="JSON file of model presets the dashboard can assign "
+                        "to this lane's GPU (default: presets.json beside the "
+                        "tokens file). See README.")
     p.add_argument("--upstream-cmd", default=None, metavar="COMMAND",
                    help="command that starts this lane's model server when "
                         "it is a plain process (not a container). Enables "
@@ -1468,7 +1647,7 @@ def _serve_and_cleanup(serve: Callable[[], None]) -> None:
 def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
     global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
-    global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME, UPSTREAM_CMD
+    global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME, UPSTREAM_CMD, PRESETS_FILE
     global CANDIDATE_PORTS, PREFER
     global _container_status, _container_last_start
     global FWD_NAME, PEERS, FWD_GPU, _control_token
@@ -1488,6 +1667,7 @@ def main(argv: list[str] | None = None) -> int:
     FWD_NAME = args.name
     FWD_GPU = args.gpu
     UPSTREAM_CMD = args.upstream_cmd
+    PRESETS_FILE = args.presets
     PEERS = list(args.peer)
     # A new process: any peer/GPU state is stale and must not survive.
     _peer_state.clear()
@@ -1506,9 +1686,19 @@ def main(argv: list[str] | None = None) -> int:
     TOKENS_FILE = args.tokens_file or _default_tokens_file()
     _load_days()
     _last_day = _today()
-    # The operator's stop from a previous run of this lane, if any. Loaded
-    # before the container poll so an unloaded GPU stays unloaded.
+    # The operator's stop and assignment from a previous run of this lane.
+    # Loaded before the container poll so an unloaded GPU stays unloaded,
+    # and so a lane that assigned a preset last time fronts it again without
+    # relaunching anything. Flags given on this command line still win.
     _load_latch()
+    _load_presets()
+    if _preset and _saved_state.get("upstream_port") and not FORCED_UPSTREAM:
+        FORCED_UPSTREAM = int(_saved_state["upstream_port"])
+        if not (WSL_DISTRO and CONTAINER_NAME) and _saved_state.get("container"):
+            WSL_DISTRO = _saved_state.get("distro")
+            CONTAINER_NAME = _saved_state.get("container")
+        log(f"resuming preset {_preset} on port {FORCED_UPSTREAM}"
+            + (f" (container {CONTAINER_NAME})" if CONTAINER_NAME else ""))
 
     if WSL_DISTRO and CONTAINER_NAME:
         _container_keepalive_start()
@@ -1516,7 +1706,7 @@ def main(argv: list[str] | None = None) -> int:
         # would act on "no upstream" that is merely "not looked yet".
         _poll_container_status(auto_start=False)
         _container_port_from_docker()
-        threading.Thread(target=_container_monitor, daemon=True).start()
+        _ensure_container_monitor()
 
     tray = None
     if args.tray:

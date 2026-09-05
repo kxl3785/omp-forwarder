@@ -123,6 +123,12 @@ def reset_state() -> None:
     fwd.UPSTREAM_CMD = None
     fwd._operator_stopped = False
     fwd._upstream_child = None
+    # Presets and the persisted lane state.
+    fwd.PRESETS_FILE = None
+    fwd._presets = {}
+    fwd._preset = None
+    fwd._saved_state = {}
+    fwd._container_monitor_started = True  # never start the real thread in tests
 
 
 class FakeUpstream:
