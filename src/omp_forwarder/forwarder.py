@@ -307,7 +307,9 @@ def _container_port_from_docker() -> int | None:
     executable discovery and can only become a candidate port. Runs on the
     monitor thread's 10-second timer, never on the request path; a failure
     simply means no derived candidate this pass, and the last good value
-    is kept."""
+    is kept. The log fires only when the derived port actually changes, not
+    every 10-second tick: the value is stable for minutes and a line per
+    tick is pure noise."""
     global _container_port
     if not (WSL_DISTRO and CONTAINER_NAME):
         _container_port = None
@@ -319,8 +321,10 @@ def _container_port_from_docker() -> int | None:
         return None
     port = _parse_container_port(res.stdout)
     if port is not None:
+        changed = port != _container_port
         _container_port = port
-        log(f"container {CONTAINER_NAME} publishes port {port}")
+        if changed:
+            log(f"container {CONTAINER_NAME} publishes port {port}")
     return port
 
 
@@ -354,6 +358,7 @@ def _container_monitor() -> None:
         time.sleep(10)
         _poll_container_status()
         _container_port_from_docker()
+        _reevaluate_upstream()
 
 
 def _sample_health() -> None:
@@ -550,38 +555,85 @@ def discover(force: bool = False) -> int | None:
         if _upstream and not force and _healthy(_upstream):
             return _upstream
 
-        servers = _listening_ports(_server_pids())
-        candidates = _candidate_ports()
+        choice = _choose_upstream()
+        if choice is None:
+            if _upstream is not None:
+                log("no healthy upstream found")
+            _upstream = None
+            _upstream_exe = None
+            _upstream_kind = None
+            return None
 
-        # Which kind we take first. The preference decides which LIST we
-        # walk first; within a kind the order is fixed: servers are already
-        # highest-port-first, candidates in the order given.
-        order = (("llama-server", servers), ("candidate", candidates)) \
-            if PREFER == "llama-server" else \
-            (("candidate", candidates), ("llama-server", servers))
+        port, kind = choice
+        if kind == "llama-server":
+            owner = _port_owner.get(port)
+            _upstream_exe = _exe_path(owner) if owner else None
+        else:
+            _upstream_exe = None
+        if port != _upstream:
+            log(f"upstream -> {HOST}:{port} ({kind})"
+                + (f" ({_upstream_exe})" if _upstream_exe else ""))
+            _stats["model"] = ""      # re-read it for the new server
+        _upstream = port
+        _upstream_kind = kind
+        return port
 
-        for kind, ports in order:
-            for port in ports:
-                if not _healthy(port):
-                    continue
-                if kind == "llama-server":
-                    owner = _port_owner.get(port)
-                    _upstream_exe = _exe_path(owner) if owner else None
-                else:
-                    _upstream_exe = None
-                if port != _upstream:
-                    log(f"upstream -> {HOST}:{port} ({kind})"
-                        + (f" ({_upstream_exe})" if _upstream_exe else ""))
-                    _stats["model"] = ""      # re-read it for the new server
-                _upstream = port
-                _upstream_kind = kind
-                return port
-        if _upstream is not None:
-            log("no healthy upstream found")
-        _upstream = None
-        _upstream_exe = None
-        _upstream_kind = None
-        return None
+
+def _choose_upstream() -> tuple[int, str] | None:
+    """The preferred healthy upstream, with no side effects on _upstream.
+
+    Re-scans the llama-server processes and the candidate ports, probes
+    each with /health in the --prefer order, and returns (port, kind) for
+    the first healthy one. None when nothing is healthy. This is the
+    scanning core of discover(), factored out so the monitor thread can
+    ask "what would discovery pick now?" without committing the result."""
+    servers = _listening_ports(_server_pids())
+    candidates = _candidate_ports()
+
+    order = (("llama-server", servers), ("candidate", candidates)) \
+        if PREFER == "llama-server" else \
+        (("candidate", candidates), ("llama-server", servers))
+
+    for kind, ports in order:
+        for port in ports:
+            if _healthy(port):
+                return (port, kind)
+    return None
+
+
+def _reevaluate_upstream() -> None:
+    """Periodically re-run discovery so a new healthy upstream can take
+    over without waiting for the current one to fail.
+
+    Runs on the monitor thread's 10-second timer. Preference is meaningless
+    if it is only evaluated once: the operator wants Studio's server to take
+    over whenever it comes back, and the container to take over when it
+    goes away. With no explicit --upstream-port, we ask what discover()
+    would choose now; if it differs from the current upstream and the new
+    choice is healthy, we switch _upstream so new connections go to it.
+    Existing relayed connections are untouched. When the current upstream
+    is still the preferred healthy choice, nothing is logged. When
+    --upstream-port is set, this is a no-op."""
+    global _upstream, _upstream_kind, _upstream_exe
+    if FORCED_UPSTREAM:
+        return
+    choice = _choose_upstream()
+    if choice is None:
+        return
+    port, kind = choice
+    old = _upstream
+    if port == old:
+        return
+    with _lock:
+        if kind == "llama-server":
+            owner = _port_owner.get(port)
+            _upstream_exe = _exe_path(owner) if owner else None
+        else:
+            _upstream_exe = None
+        _stats["model"] = ""
+        _upstream = port
+        _upstream_kind = kind
+    log(f"upstream -> {HOST}:{port} ({kind}), preferred over {old}")
 
 
 def _tally_tokens(port: int | None, metrics: dict,

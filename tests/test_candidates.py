@@ -201,6 +201,124 @@ class CandidateDiscoverTests(ForwarderCase):
         self.assertEqual(fwd._candidate_ports(), [a])
 
 
+class ReevaluateUpstreamTests(ForwarderCase):
+    """_reevaluate_upstream() on the recorded fixtures.
+
+    The monitor thread re-runs discovery on every 10-second tick so a
+    healthy llama-server can take over a candidate without waiting for
+    the candidate to fail, and a candidate can take over when the
+    llama-server goes away. The log fires only on an actual switch."""
+
+    def _docker_responder(self, stdout: str):
+        def fake_run_wsl(args, timeout=10.0):
+            if "docker" in args and "port" in args:
+                return subprocess.CompletedProcess(
+                    args=args, returncode=0, stdout=stdout, stderr="")
+            raise AssertionError(f"unexpected _run_wsl call: {args}")
+        return fake_run_wsl
+
+    def _server_pids(self, pids):
+        return mock.patch.object(fwd, "_server_pids", return_value=pids)
+
+    def _listening_ports(self, ports):
+        return mock.patch.object(fwd, "_listening_ports",
+                                  side_effect=lambda pids: ports
+                                  if pids else [])
+
+    def test_switch_to_llama_server_when_it_appears(self):
+        # Current upstream is a healthy candidate; a llama-server becomes
+        # healthy. One re-evaluation pass switches to it, upstream_kind
+        # is "llama-server", and exactly one switch line is logged.
+        cand = self.fake()
+        server = self.fake()
+        fwd.CANDIDATE_PORTS = [cand.port]
+        fwd._upstream = cand.port
+        fwd._upstream_kind = "candidate"
+        fwd._port_owner[server.port] = "39900"
+        with self._server_pids({"39900"}), \
+                self._listening_ports([server.port]):
+            log_lines = []
+            with mock.patch.object(fwd, "log", log_lines.append):
+                fwd._reevaluate_upstream()
+        self.assertEqual(fwd._upstream, server.port)
+        self.assertEqual(fwd._upstream_kind, "llama-server")
+        self.assertEqual(
+            [l for l in log_lines if "upstream ->" in l],
+            [f"upstream -> {fwd.HOST}:{server.port} (llama-server), "
+             f"preferred over {cand.port}"])
+
+    def test_prefer_candidate_no_switch(self):
+        # Same setup, but --prefer candidate: the re-evaluation pass finds
+        # the candidate is still the preferred healthy choice, so nothing
+        # switches and nothing is logged.
+        cand = self.fake()
+        server = self.fake()
+        fwd.CANDIDATE_PORTS = [cand.port]
+        fwd.PREFER = "candidate"
+        fwd._upstream = cand.port
+        fwd._upstream_kind = "candidate"
+        fwd._port_owner[server.port] = "39900"
+        with self._server_pids({"39900"}), \
+                self._listening_ports([server.port]):
+            log_lines = []
+            with mock.patch.object(fwd, "log", log_lines.append):
+                fwd._reevaluate_upstream()
+        self.assertEqual(fwd._upstream, cand.port)
+        self.assertEqual(fwd._upstream_kind, "candidate")
+        self.assertEqual(log_lines, [])
+
+    def test_nothing_better_logs_nothing(self):
+        # Preferred upstream is healthy and nothing better exists: a
+        # re-evaluation pass changes nothing and logs nothing.
+        cand = self.fake()
+        fwd.CANDIDATE_PORTS = [cand.port]
+        fwd._upstream = cand.port
+        fwd._upstream_kind = "candidate"
+        with self._server_pids(set()), self._listening_ports([]):
+            log_lines = []
+            with mock.patch.object(fwd, "log", log_lines.append):
+                fwd._reevaluate_upstream()
+        self.assertEqual(fwd._upstream, cand.port)
+        self.assertEqual(fwd._upstream_kind, "candidate")
+        self.assertEqual(log_lines, [])
+
+    def test_forced_upstream_is_noop(self):
+        # --upstream-port set: re-evaluation is a no-op even when a
+        # preferred candidate is healthy.
+        forced = self.fake()
+        cand = self.fake()
+        fwd.FORCED_UPSTREAM = forced.port
+        fwd.CANDIDATE_PORTS = [cand.port]
+        with mock.patch.object(fwd, "_choose_upstream",
+                               side_effect=AssertionError("scanned")):
+            fwd._reevaluate_upstream()
+        self.assertEqual(fwd._upstream, None)
+
+    def test_container_port_log_only_on_change(self):
+        # Two passes with the same docker port output log once; a changed
+        # output logs again.
+        out = "30000/tcp -> 0.0.0.0:30000\n"
+        fwd.WSL_DISTRO = "Ubuntu-24.04"
+        fwd.CONTAINER_NAME = "sgl"
+        with mock.patch.object(fwd, "_run_wsl",
+                               side_effect=self._docker_responder(out)) \
+                as fake_wsl, \
+                mock.patch.object(fwd, "log") as fake_log:
+            # First call: _container_port is None -> 30000, logs.
+            self.assertEqual(fwd._container_port_from_docker(), 30000)
+            self.assertEqual(fake_log.call_count, 1)
+            fake_log.assert_called_with("container sgl publishes port 30000")
+            # Second call: same port -> no new log.
+            self.assertEqual(fwd._container_port_from_docker(), 30000)
+            self.assertEqual(fake_log.call_count, 1)
+            # Changed port -> logs again.
+            fake_wsl.side_effect = self._docker_responder(
+                "30001/tcp -> 0.0.0.0:30001\n")
+            self.assertEqual(fwd._container_port_from_docker(), 30001)
+            self.assertEqual(fake_log.call_count, 2)
+            fake_log.assert_called_with("container sgl publishes port 30001")
+
+
 class StudioPortNeverCandidateTests(RelayCase):
     """Scenario 8: Studio's port is never chosen from candidates.
 
