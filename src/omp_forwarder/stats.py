@@ -220,6 +220,13 @@ def snapshot(fwd, stats: dict) -> dict:
         # Which llama-server executable answered. Discovery cannot tell two
         # of them apart by port, so this is how a wrong one becomes visible.
         "upstream_exe": getattr(fwd, "_upstream_exe", None),
+        # How the current upstream was found: executable-matched
+        # ("llama-server"), a --candidate-port / derived container port
+        # ("candidate"), or a pinned --upstream-port ("explicit"). null when
+        # there is no upstream.
+        "upstream_kind": getattr(fwd, "_upstream_kind", None),
+        # The configured choice between the two kinds when both are healthy.
+        "prefer": getattr(fwd, "PREFER", "llama-server"),
         "container": getattr(fwd, "_container_status", None),
         "container_name": getattr(fwd, "CONTAINER_NAME", None),
         "model": stats.get("model") or "-",
@@ -460,6 +467,7 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
   <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
   <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
   <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
+  <div class="row"><span class="fk">Upstream</span><span class="fv dim" id="f_up" title="How the current upstream was found; the configured preference">&mdash;</span></div>
 </div>
 
 <h2 id="model_h">Model &mdash; live, from llama-server<span class="rule"></span>
@@ -788,6 +796,16 @@ async function tick(){
   const kaEl=$("f_ka");
   if(s.keepalive_pid){ kaEl.textContent=s.keepalive_pid; kaEl.classList.remove("dim"); }
   else { kaEl.innerHTML="&mdash;"; kaEl.classList.add("dim"); }
+  // One line for both: the kind that was chosen and the configured
+  // preference, so a candidate upstream next to "prefer llama-server"
+  // reads as "the preferred kind was down, this is the fallback".
+  const upEl=$("f_up");
+  if(s.upstream_kind && s.upstream){
+    upEl.textContent=s.upstream_kind+" :"+s.upstream+" · prefer "+(s.prefer||"llama-server");
+    upEl.title="chosen: "+s.upstream_kind+" on port "+s.upstream
+      +"; configured preference: "+(s.prefer||"llama-server");
+    upEl.classList.remove("dim");
+  } else { upEl.innerHTML="&mdash;"; upEl.classList.add("dim"); }
 
   // --- control buttons: only visible when container mode is on ---
   const ctl=$("ctl");

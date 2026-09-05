@@ -107,6 +107,8 @@ itself. Make a desktop shortcut to that file and point the shortcut's icon at
 | `--upstream-exe S` | only use a `llama-server` whose executable path contains `S` |
 | `--wait-for-model N` | seconds to wait for a model during a reload (default 30; 0 disables) |
 | `--studio-fallback` | relay to Studio when no model is loaded, instead of 503 |
+| `--candidate-port N` | a model server discovery cannot find by executable (e.g. a container's published port), probed with `/health` like everything else; repeatable, and the order is the tie-break among healthy candidates |
+| `--prefer KIND` | which upstream kind to take when both are healthy: `llama-server` (default) or `candidate`; the preferred kind wins, the other is the fallback when nothing of the preferred kind is up |
 | `--tokens-file PATH` | where per-day token totals are kept |
 | `--wsl-distro NAME` | WSL distro that hosts the upstream Docker container (use with `--container`) |
 | `--container NAME` | Docker container name inside the distro (use with `--wsl-distro`) |
@@ -136,6 +138,37 @@ Both flags are required together. When given, the forwarder:
 The dashboard's **Container** bit in the header bar is hidden when container
 mode is off. In `GET /__stats.json` the fields are `container` (status string
 or `null`) and `container_name` (the container name, or `null`).
+
+### How the upstream is chosen
+
+Discovery works on two kinds of candidate, probed identically with `/health`
+(both `llama-server` and SGLang answer 200 — there is no engine-specific
+probe).
+
+- **llama-server** — executable-matched, exactly as before: the PIDs of the
+  running `llama-server` processes are taken from `tasklist` and their
+  listening ports from `netstat`, then the **highest** healthy one is chosen.
+- **candidate** — a port that discovery cannot find by executable: a
+  `--candidate-port N` entry, or the container's published port read from
+  `docker port` on the 10-second monitor thread (never on the request path).
+  When the container exposes one published port, that is the candidate; when
+  it publishes several, the first healthy flag-supplied port wins.
+
+An explicit `--upstream-port` always wins over both. Otherwise, among the
+healthy candidates, `--prefer` (default `llama-server`) decides which kind to
+take: the preferred kind when it is up, the other kind when it is not. Within
+a kind, the order is as above (highest port for `llama-server`, first in the
+list for `candidate`). If nothing is healthy, the existing `--wait-for-model`
+wait-then-503-with-`Retry-After` path applies unchanged. Re-discovery runs
+these same rules on every re-scan, so a preferred `llama-server` that comes
+back takes over at the next discovery pass without cutting existing
+connections.
+
+A model server in a Docker container inside WSL2 (SGLang on `:30000`, say)
+has no Windows executable behind its listener, so it is invisible to
+executable discovery and must be supplied as a candidate — pass it with
+`--candidate-port`, or let the container's published port be derived when
+container mode is on.
 
 ## Dashboard control surface
 

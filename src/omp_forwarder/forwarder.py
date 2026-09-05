@@ -86,7 +86,19 @@ _container_status: str | None = None
 _container_keepalive: subprocess.Popen | None = None
 #: Timestamp of the last auto-start attempt; the monitor retries at most
 #: once a minute so a container that keeps crashing is not hammered.
-_container_last_start: float = 0.0
+#: Ports given on the command line (--candidate-port, repeatable): model
+#: servers that discovery cannot find by executable, e.g. a container
+#: published port.
+CANDIDATE_PORTS: list[int] = []
+#: The container's published port as last read by `docker port` on the
+#: monitor thread; None when container mode is off or the call failed.
+#: Refreshed on the 10-second timer, never on the request path.
+_container_port: int | None = None
+#: What the current _upstream was found to be: "llama-server" (executable
+#: matched in netstat), "candidate" (--candidate-port / a derived
+#: container port), "explicit" (--upstream-port), or None when no upstream.
+#: Read by the dashboard; set in discover().
+_upstream_kind: str | None = None
 
 _lock = threading.Lock()
 _upstream: int | None = None
@@ -96,7 +108,10 @@ _upstream: int | None = None
 #: honest "ready" light -- /health (not /metrics) is the answer SGLang gives,
 #: so a healthy upstream must not read as "unreachable" just because it has
 #: no /metrics endpoint.
-_upstream_healthy: bool = False
+#: The configured choice between the two upstream kinds when both are
+#: healthy, from --prefer (default llama-server).
+PREFER: str = "llama-server"
+#: Set when a relayed request completes; the sampler thread waits on it.
 #: Deployment facts the monitor thread last read from the upstream's
 #: /get_server_info or /props, refreshed every 10 s so the dashboard poll
 #: (the request path) only copies them. Shape: {engine, thinking,
@@ -285,12 +300,60 @@ def _container_keepalive_stop() -> None:
         log("keepalive stopped")
 
 
+def _container_port_from_docker() -> int | None:
+    """The container's published port, or None when `docker port` fails.
+    A container inside WSL2 has no Windows process behind its listener, so
+    netstat matching by executable path cannot see it: it is invisible to
+    executable discovery and can only become a candidate port. Runs on the
+    monitor thread's 10-second timer, never on the request path; a failure
+    simply means no derived candidate this pass, and the last good value
+    is kept."""
+    global _container_port
+    if not (WSL_DISTRO and CONTAINER_NAME):
+        _container_port = None
+        return None
+    res = _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+                   "docker", "port", CONTAINER_NAME],
+                  timeout=10)
+    if res is None or res.returncode != 0:
+        return None
+    port = _parse_container_port(res.stdout)
+    if port is not None:
+        _container_port = port
+        log(f"container {CONTAINER_NAME} publishes port {port}")
+    return port
+
+
+def _parse_container_port(out: str) -> int | None:
+    """The host port a `docker port` output publishes, or None.
+
+    `docker port` prints one line per mapping, IPv4 and IPv6:
+        30000/tcp -> 0.0.0.0:30000
+        30000/tcp -> [::]:30000
+    The host port is what comes after the LAST colon of each line, and the
+    IPv6 line repeats the same one. Deduping leaves one port when the
+    container publishes one. A malformed or empty output yields None,
+    which the caller treats as "no derived candidate"."""
+    ports = []
+    for line in out.splitlines():
+        m = re.search(r":(\d+)\s*$", line.rstrip())
+        if m:
+            p = int(m.group(1))
+            if p not in ports:
+                ports.append(p)
+    return ports[0] if len(ports) == 1 else None
+
+
 def _container_monitor() -> None:
     """Background thread: polls container status every 10 s so the dashboard
-    shows a live state and auto-start can trigger. Never on the request path."""
+    shows a live state and auto-start can trigger. Also re-reads the
+    container's published port, the only candidate source that can change
+    underneath us (a `docker port` re-run after the container comes up).
+    Never on the request path."""
     while True:
         time.sleep(10)
         _poll_container_status()
+        _container_port_from_docker()
 
 
 def _sample_health() -> None:
@@ -451,29 +514,73 @@ def _healthy(port: int) -> bool:
         return False
 
 
+def _candidate_ports() -> list[int]:
+    """Ports to probe besides the executable-matched llama-server scan:
+    --candidate-port entries in the order given, then the container's
+    published port (derived on the monitor thread). Deduped, excluding the
+    ports already excluded (our listen port and Studio's). The candidate
+    list is never empty-checked: with no candidate at all the scan still
+    finds llama-server exactly as before."""
+    seen = set()
+    out = []
+    for port in list(CANDIDATE_PORTS) + ([_container_port] if _container_port else []):
+        if port in EXCLUDE_PORTS or port in seen:
+            continue
+        seen.add(port)
+        out.append(port)
+    return out
+
+
 def discover(force: bool = False) -> int | None:
-    """The current llama-server port, cached. force=True re-scans."""
-    global _upstream, _upstream_exe
+    """The current upstream port, cached. force=True re-scans.
+
+    Two kinds of candidate: "llama-server" (executable-matched, as before)
+    and "candidate" (--candidate-port / a derived container port, which the
+    executable scan cannot see). Both are probed with /health. Among the
+    healthy ones the --prefer setting picks the kind (default llama-server);
+    within llama-server the highest healthy port wins, within candidate the
+    first healthy one. An explicit --upstream-port still wins over all of
+    this and is unchanged."""
+    global _upstream, _upstream_exe, _upstream_kind
     with _lock:
         if FORCED_UPSTREAM:
             _upstream = FORCED_UPSTREAM
+            _upstream_kind = "explicit"
             return _upstream
         if _upstream and not force and _healthy(_upstream):
             return _upstream
-        for port in _listening_ports(_server_pids()):
-            if _healthy(port):
-                if port != _upstream:
+
+        servers = _listening_ports(_server_pids())
+        candidates = _candidate_ports()
+
+        # Which kind we take first. The preference decides which LIST we
+        # walk first; within a kind the order is fixed: servers are already
+        # highest-port-first, candidates in the order given.
+        order = (("llama-server", servers), ("candidate", candidates)) \
+            if PREFER == "llama-server" else \
+            (("candidate", candidates), ("llama-server", servers))
+
+        for kind, ports in order:
+            for port in ports:
+                if not _healthy(port):
+                    continue
+                if kind == "llama-server":
                     owner = _port_owner.get(port)
                     _upstream_exe = _exe_path(owner) if owner else None
-                    log(f"upstream -> {HOST}:{port}"
+                else:
+                    _upstream_exe = None
+                if port != _upstream:
+                    log(f"upstream -> {HOST}:{port} ({kind})"
                         + (f" ({_upstream_exe})" if _upstream_exe else ""))
                     _stats["model"] = ""      # re-read it for the new server
                 _upstream = port
+                _upstream_kind = kind
                 return port
         if _upstream is not None:
-            log("no healthy llama-server found")
+            log("no healthy upstream found")
         _upstream = None
         _upstream_exe = None
+        _upstream_kind = None
         return None
 
 
@@ -933,6 +1040,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         "contains this. Use it when you run more than one: "
                         "discovery cannot otherwise tell them apart, and the "
                         "wrong model will answer silently. Try '.unsloth'")
+    p.add_argument("--candidate-port", type=int, action="append", default=[],
+                   metavar="PORT",
+                   help="a model server discovery cannot find by executable "
+                        "path, e.g. a container's published port. Probed "
+                        "with /health like everything else. Repeatable; "
+                        "order is the tie-break among healthy candidates.")
+    p.add_argument("--prefer", choices=("llama-server", "candidate"),
+                   default="llama-server",
+                   help="which kind of upstream to take when both are "
+                        "healthy: the executable-matched llama-server "
+                        "(default) or a --candidate-port / derived container "
+                        "port. The preferred kind wins; the other is the "
+                        "fallback when nothing of the preferred kind is up.")
     p.add_argument("--studio-fallback", action="store_true",
                    help="relay to Studio when no llama-server is running, "
                         "instead of answering 503. Only useful if your client "
@@ -985,6 +1105,7 @@ def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
     global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
     global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME
+    global CANDIDATE_PORTS, PREFER
     global _container_status, _container_last_start
     global FWD_NAME, PEERS, _control_token
     args = _parse_args(argv)
@@ -996,6 +1117,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     UPSTREAM_EXE = args.upstream_exe
+    CANDIDATE_PORTS = list(args.candidate_port)
+    PREFER = args.prefer
     WSL_DISTRO = args.wsl_distro
     CONTAINER_NAME = args.container
     FWD_NAME = args.name
@@ -1018,6 +1141,7 @@ def main(argv: list[str] | None = None) -> int:
     if WSL_DISTRO and CONTAINER_NAME:
         _container_keepalive_start()
         _poll_container_status()
+        _container_port_from_docker()
         threading.Thread(target=_container_monitor, daemon=True).start()
 
     tray = None

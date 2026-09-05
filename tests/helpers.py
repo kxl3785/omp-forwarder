@@ -81,6 +81,10 @@ def reset_state() -> None:
     fwd.STUDIO_FALLBACK = False
     fwd.UPSTREAM_EXE = None
     fwd._upstream_exe = None
+    fwd.CANDIDATE_PORTS = []
+    fwd._container_port = None
+    fwd._upstream_kind = None
+    fwd.PREFER = "llama-server"
     fwd._port_owner = {}
     # A dead port, so a test that falls back cannot reach a real Studio.
     fwd.STUDIO_PORT = free_port()
