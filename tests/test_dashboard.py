@@ -175,6 +175,17 @@ class SnapshotFactsTests(ForwarderCase):
         d = stats.snapshot(fwd, fwd._stats)
         self.assertIsNone(d["keepalive_pid"])
 
+    def test_metrics_unavailable_but_facts_present(self):
+        # SGLang has no /metrics, so metrics_available is false, but the
+        # sampler still populates facts from /get_server_info. The dashboard
+        # must show "not provided by this upstream" on the /metrics cards
+        # while still rendering the Deployment panel with engine data.
+        fwd._upstream_facts = {"engine": "sglang", "thinking": "on"}
+        fwd._upstream = None
+        d = stats.snapshot(fwd, fwd._stats)
+        self.assertFalse(d["metrics_available"])
+        self.assertEqual(d["facts"]["engine"], "sglang")
+
 
 # ----------------------------------------------------------------
 # 3. Container controls: POST /__control

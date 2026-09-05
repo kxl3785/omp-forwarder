@@ -326,8 +326,8 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .tabs a+a{border-left:1px solid var(--line)}
 .tabs a:hover{color:var(--ink)}
 .tabs a.on{color:var(--teal);background:var(--panel)}
-.on{background:var(--green);box-shadow:0 0 0 3px rgba(92,201,140,.16)}
-.off{background:var(--red);box-shadow:0 0 0 3px rgba(226,104,95,.16)}
+.dot.on{background:var(--green);box-shadow:0 0 0 3px rgba(92,201,140,.16)}
+.dot.off{background:var(--red);box-shadow:0 0 0 3px rgba(226,104,95,.16)}
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:13px 16px 14px}
@@ -403,16 +403,21 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
 .ctl button.danger:hover{color:var(--red);border-color:var(--red);
   background:rgba(226,104,95,.07)}
 #ctl_msg{font-size:11px;color:var(--dim);margin-left:8px}
-/* Peer links ride the title line. */
-.peers{display:flex;gap:8px;margin-left:auto;margin-right:16px;align-items:center}
-.peers a{font-family:var(--mono);font-size:11px;color:var(--dim);
+/* Peer pills ride the tabs row, right-aligned. */
+.peers{display:flex;gap:6px;align-items:center}
+.peers a.lane{font-family:var(--mono);font-size:11px;color:var(--dim);
   text-decoration:none;border:1px solid var(--line);border-radius:6px;
   padding:2px 8px}
-.peers a:hover{color:var(--teal);border-color:var(--teal)}
-.peers .lbl{font-size:9.5px;letter-spacing:.1em;color:var(--dim);
-  text-transform:uppercase;margin-right:2px}
-.fname{font-family:var(--mono);font-size:15px;color:var(--teal);
-  margin-left:6px;font-weight:600}
+.peers a.lane:hover{color:var(--teal);border-color:var(--teal)}
+.fname{font-family:var(--mono);font-size:13px;color:var(--dim);
+  margin-left:8px;font-weight:400}
+.tabsrow{display:flex;align-items:center;gap:16px;margin-top:10px}
+.tabsrow .peers{margin-left:auto}
+.pill{display:inline-block;font-family:var(--mono);font-size:11px;
+  border:1px solid var(--line);background:transparent;border-radius:10px;
+  padding:1px 7px;color:var(--dim);letter-spacing:.04em}
+.pill.on{color:var(--green);border-color:var(--green)}
+.pill.off{color:var(--red);border-color:var(--red)}
 </style>
 <svg style="display:none">
   <symbol id="ico-rst" viewBox="0 0 24 24" fill="none" stroke="currentColor"
@@ -429,8 +434,10 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
         stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
 </svg>
 <span>omp forwarder</span><span class="fname" id="fname"></span></h1>
-<div class="peers" id="peers"></div>
+<div class="tabsrow">
 <nav class="tabs"><a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a></nav>
+<div class="peers" id="peers"></div>
+</div>
 </div>
 <div class="sub">Traffic omp sends straight to llama-server &mdash; the requests Unsloth&rsquo;s own API panel cannot see.</div>
 
@@ -445,7 +452,17 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
     <svg><use href="#ico-rst"/></svg>Reset all</button>
 </div>
 
-<h2>Model &mdash; live, from llama-server<span class="rule"></span>
+<h2>Deployment<span class="rule"></span></h2>
+<div class="facts" id="facts">
+  <div class="row"><span class="fk">Engine</span><span class="fv dim" id="f_engine">&mdash;</span></div>
+  <div class="row"><span class="fk">Thinking</span><span class="fv" id="f_thinking">&mdash;</span></div>
+  <div class="row"><span class="fk">Speculative</span><span class="fv dim" id="f_spec">&mdash;</span></div>
+  <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
+  <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
+  <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
+</div>
+
+<h2 id="model_h">Model &mdash; live, from llama-server<span class="rule"></span>
   <span class="since" id="since-model"></span>
   <button class="rst" data-sect="model" title="Count from now"><svg><use href="#ico-rst"/></svg>Session</button></h2>
 <div class="grid">
@@ -481,7 +498,7 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
     <div class="v" id="tmax">&mdash;</div><div class="n" id="tmax_n">tokens, high water</div></div>
 </div>
 
-<h2>Per stream &mdash; from /slots<span class="rule"></span>
+<h2>Per stream &mdash; <span id="slots_src">from /slots</span><span class="rule"></span>
   <span class="since" id="slots_n"></span></h2>
 <div id="slots" class="slots"><div class="quiet">no stream is generating</div></div>
 
@@ -500,16 +517,6 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
     <div class="v" id="e5">&mdash;</div><div class="n" id="e5_n">HTTP 5xx</div></div>
   <div class="card"><div class="k">Client errors</div>
     <div class="v" id="e4">&mdash;</div><div class="n">HTTP 4xx</div></div>
-</div>
-
-<h2>Deployment<span class="rule"></span></h2>
-<div class="facts" id="facts">
-  <div class="row"><span class="fk">Engine</span><span class="fv dim" id="f_engine">&mdash;</span></div>
-  <div class="row"><span class="fk">Thinking</span><span class="fv dim" id="f_thinking">&mdash;</span></div>
-  <div class="row"><span class="fk">Speculative</span><span class="fv dim" id="f_spec">&mdash;</span></div>
-  <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
-  <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
-  <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
 </div>
 
 <div class="foot">
@@ -602,11 +609,26 @@ async function tick(){
   catch(e){ if(++missed>2) document.body.classList.add("stale"); return; }
   missed=0; document.body.classList.remove("stale");
   const M=adj(s,"model"), S=adj(s,"server"), F=adj(s,"fwd");
+  const noMetrics = !s.metrics_available;
 
+  // --- engine-aware section titles and subtitle ---
+  const engine = (s.facts||{}).engine || "unknown";
+  const engineSuffix = engine==="llama-server" ? "llama-server"
+                      : engine==="sglang"       ? "SGLang" : "upstream";
+  const modelH=$("model_h");
+  modelH.childNodes[0].textContent =
+    "Model — live, from "+engineSuffix+" ";
+  const subEl=document.querySelector(".sub");
+  subEl.innerHTML = "Traffic omp sends straight to "+engineSuffix
+    + " &mdash; the requests Unsloth&rsquo;s own API panel cannot see.";
+  const slotsSrc=$("slots_src");
+  slotsSrc.textContent = engine==="llama-server" ? "from /slots"
+    : "not provided by this upstream";
+
+  // --- bar ---
   $("listen").textContent="127.0.0.1:"+s.listen;
   _ctrlToken=s.control_token||"";
   $("up").textContent=s.upstream?("127.0.0.1:"+s.upstream):"Studio :8888 (fallback)";
-  // Hovering names the executable: two llama-servers look identical here.
   $("up").title = s.upstream_exe || "";
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.healthy?"on":"off");
@@ -618,21 +640,12 @@ async function tick(){
     $("cont").textContent=""; $("cont").title="";
   }
 
-  // in flight / largest context are instantaneous, never baselined
-  $("inflight").textContent=s.processing;
-  $("inflight_n").textContent=s.deferred>0?(s.deferred+" queued"):(s.processing>0?"busy":"idle");
-  $("tmax").textContent=Math.round(s.tokens_max).toLocaleString();
-  $("tmax_n").textContent = s.ctx>0
-    ? "high water · window "+Math.round(s.ctx).toLocaleString()
-    : "tokens, high water";
-
+  // --- forwarder-only cards: always live ---
   const tok=F.tok_prompt+F.tok_gen;
   $("tok").textContent=Math.round(tok).toLocaleString();
   let tokNote = tok>0
     ? Math.round(F.tok_prompt).toLocaleString()+" prompt · "+Math.round(F.tok_gen).toLocaleString()+" generated"
     : "prompt + generated";
-  // Today's figure survives forwarder restarts; show it only when it differs
-  // from the since-start total, i.e. when the forwarder restarted today.
   const today=(s.tok_today_prompt||0)+(s.tok_today_gen||0);
   if(today>0 && Math.round(today)!==Math.round(s.tok_prompt+s.tok_gen))
     tokNote += " · today "+Math.round(today).toLocaleString();
@@ -645,37 +658,28 @@ async function tick(){
   $("e5").className="v "+(F.status_5xx>0?"red":"");
   const tot=F.status_2xx+F.status_4xx+F.status_5xx;
   $("e5_n").textContent=tot?("HTTP 5xx · "+(100*F.status_5xx/tot).toFixed(1)+"% of replies"):"HTTP 5xx";
-
-  // A long generation makes this tens of thousands of ms, which reads badly.
   const ms=s.latency_p50_ms;
   if(ms==null){ $("p50").textContent="—"; $("p50u").textContent="ms"; }
   else if(ms>=1000){ $("p50").textContent=(ms/1000).toFixed(1); $("p50u").textContent="s"; }
   else { $("p50").textContent=Math.round(ms); $("p50u").textContent="ms"; }
 
-  const seen=S.prompt_cached+S.prompt_tokens;
-  if(seen>0){ const h=100*S.prompt_cached/seen;
-    $("hit").textContent=h.toFixed(1); meterSet($("hit_m"),h,60,35);
-    $("hit_n").textContent=Math.round(S.prompt_cached).toLocaleString()+" tokens reused"; }
-  else { $("hit").textContent="—"; $("hit_n").textContent="no prompts yet"; }
-
-  if(S.decode_steps>0){ const tpp=S.gen_tokens/S.decode_steps;
-    $("tpp").textContent=tpp.toFixed(2);
-    $("tpp_n").textContent = tpp<1.15 ? "speculation buying ~nothing"
-                                      : "vs 1.00 without speculation"; }
-  else { $("tpp").textContent="—"; $("tpp_n").textContent="no passes yet"; }
-
-  const live=renderSlots(s);
-
-  if(prev){
+  // --- model section: throughput, decode, prefill, draft ---
+  const NP = "not provided by this upstream";
+  if(noMetrics){
+    $("tput").textContent="—"; $("tput_n").textContent=NP;
+    $("dec").textContent="—";  $("dec_n").textContent=NP;
+    $("pre").textContent="—";  $("pre_n").textContent=NP;
+    $("acc").textContent="—";  $("acc_n").textContent=NP;
+    meterSet($("acc_m"),0,50,40);
+  } else if(prev){
     const dg=s.gen_tokens-prev.gen_tokens, dsec=s.gen_seconds-prev.gen_seconds;
     const dp=s.prompt_tokens-prev.prompt_tokens, dps=s.prompt_seconds-prev.prompt_seconds;
     const dd=s.draft_total-prev.draft_total, da=s.draft_accepted-prev.draft_accepted;
     const dsteps=s.decode_steps-prev.decode_steps, dw=s.t-prev.t;
+    const live=renderSlots(s);
 
-    // Throughput comes from the per-stream rates when /slots is available.
-    // tokens_predicted_total (dg) moves only when a request COMPLETES, so a
-    // 1,932-token reply that finished inside one 3 s window once read as
-    // 648 tok/s. The streams count tokens as they are produced.
+    // Throughput: prefer per-stream decode rates from /slots; fall back to
+    // the completion counter when /slots is unavailable.
     if((s.slots||[]).length){
       if(live.decoding>0 && live.haveRate){
         $("tput").textContent=fmt(live.total);
@@ -715,6 +719,44 @@ async function tick(){
         + (avg ? (sess?'<span class="tag">session</span>':LIFE) : ""); }
     else { $("acc").textContent="—"; $("acc_n").textContent="no drafts yet"; }
   }
+
+  // --- server section: in flight, prompt cache, tokens per pass, largest ctx ---
+  if(noMetrics){
+    $("inflight").textContent="—"; $("inflight_n").textContent=NP;
+    $("hit").textContent="—";  $("hit_n").textContent=NP;
+    meterSet($("hit_m"),0,60,35);
+    $("tpp").textContent="—";  $("tpp_n").textContent=NP;
+    $("tmax").textContent="—"; $("tmax_n").textContent=NP;
+  } else {
+    $("inflight").textContent=s.processing;
+    $("inflight_n").textContent=s.deferred>0?(s.deferred+" queued"):(s.processing>0?"busy":"idle");
+    $("tmax").textContent=Math.round(s.tokens_max).toLocaleString();
+    $("tmax_n").textContent = s.ctx>0
+      ? "high water · window "+Math.round(s.ctx).toLocaleString()
+      : "tokens, high water";
+
+    const seen=S.prompt_cached+S.prompt_tokens;
+    if(seen>0){ const h=100*S.prompt_cached/seen;
+      $("hit").textContent=h.toFixed(1); meterSet($("hit_m"),h,60,35);
+      $("hit_n").textContent=Math.round(S.prompt_cached).toLocaleString()+" tokens reused"; }
+    else { $("hit").textContent="—"; $("hit_n").textContent="no prompts yet"; }
+
+    if(S.decode_steps>0){ const tpp=S.gen_tokens/S.decode_steps;
+      $("tpp").textContent=tpp.toFixed(2);
+      $("tpp_n").textContent = tpp<1.15 ? "speculation buying ~nothing"
+                                        : "vs 1.00 without speculation"; }
+    else { $("tpp").textContent="—"; $("tpp_n").textContent="no passes yet"; }
+  }
+
+  // --- per-stream table: render or show not-provided ---
+  if(noMetrics){
+    const box=document.getElementById("slots");
+    box.innerHTML='<div class="quiet">not provided by this upstream</div>';
+    document.getElementById("slots_n").textContent="";
+  } else if(!prev){
+    renderSlots(s);
+  }
+
   // --- lane identity: name, peers, title ---
   if(s.name){ $("fname").textContent="· "+s.name;
     $("pg_title").textContent="omp forwarder · "+s.name; }
@@ -722,8 +764,7 @@ async function tick(){
     $("pg_title").textContent="omp forwarder"; }
   const pb=$("peers");
   if(s.peers && s.peers.length){
-    pb.innerHTML='<span class="lbl">Peers</span>'
-      +s.peers.map(pp=>'<a href="/__stats" data-peer="'+pp+'" target="_blank">'+pp+'</a>').join("");
+    pb.innerHTML=s.peers.map(pp=>'<a class="lane" href="http://127.0.0.1:'+pp+'/__stats" target="_blank">lane :'+pp+'</a>').join("");
   } else { pb.innerHTML=""; }
 
   // --- deployment facts ---
@@ -732,7 +773,15 @@ async function tick(){
     if(v && v!=="unknown" && v!=="none"){ el.textContent=v; el.classList.remove("dim"); }
     else { el.innerHTML=(v==="none")?"none":"&mdash;"; el.classList.add("dim"); } };
   setF("f_engine", F2.engine);
-  setF("f_thinking", F2.thinking);
+  // Thinking renders as a pill so on/off reads at a glance.
+  const thEl=$("f_thinking");
+  if(F2.thinking==="on"||F2.thinking==="off"){
+    thEl.className="fv pill "+F2.thinking;
+    thEl.textContent=F2.thinking;
+  } else {
+    thEl.className="fv dim";
+    thEl.innerHTML=F2.thinking==="none"?"none":"&mdash;";
+  }
   setF("f_spec", F2.speculative==="none"?"none":(F2.speculative||"unknown"));
   setF("f_par", F2.parallel);
   setF("f_model", F2.model_path);
