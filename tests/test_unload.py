@@ -8,8 +8,11 @@ was just unloaded. start/restart on a process lane exist only when
 subprocess seam is replaced."""
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import subprocess
+import unittest
 from unittest import mock
 
 from omp_forwarder import forwarder as fwd
@@ -207,6 +210,33 @@ class StopResolvesPidOnDemandTests(RelayCase):
         self.assertEqual(_body(out)["status"], "stopped")
         self.assertEqual([a[0] for a in seen], ["netstat", "taskkill"])
         self.assertIn("4242", seen[1])
+
+
+class ModuleGlobalsAreDefinedTests(unittest.TestCase):
+    """Every name a function declares `global` must be assigned at module
+    level. reset_state() creates such attributes for the tests, so a missing
+    definition is invisible to every other test here -- and a real
+    container-mode forwarder crashed with NameError on its first poll when
+    _container_last_start lost its definition. This reads the source, so no
+    fixture can mask it."""
+
+    def test_every_global_has_a_module_level_assignment(self):
+        src = inspect.getsource(fwd)
+        tree = ast.parse(src)
+        declared = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Global):
+                declared.update(node.names)
+        defined = set()
+        for node in tree.body:
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name):
+                        defined.add(t.id)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                defined.add(node.target.id)
+        missing = sorted(declared - defined)
+        self.assertEqual(missing, [], f"declared global but never defined at module level: {missing}")
 
 
 class SnapshotUnloadFieldsTests(ForwarderCase):

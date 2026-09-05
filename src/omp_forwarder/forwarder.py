@@ -102,6 +102,16 @@ _container_status: str | None = None
 #: Keepalive child so WSL2 does not tear the distro down between our
 #: commands; see _container_keepalive_start.
 _container_keepalive: subprocess.Popen | None = None
+#: When auto-start last ran docker start; it retries at most once a minute.
+#: This line went missing in a later round and nothing noticed: the tests
+#: create the attribute in reset_state(), so only a real container-mode
+#: forwarder crashed, on its first poll. tests/test_unload.py now checks
+#: that every `global` name is defined at module level.
+_container_last_start: float = 0.0
+#: Result of the last /health probe of the upstream, set by _sample_health on
+#: the sampler thread. Defined here so a read before the first sample is
+#: False rather than a NameError; the same static test guards this one.
+_upstream_healthy: bool = False
 #: Timestamp of the last auto-start attempt; the monitor retries at most
 #: once a minute so a container that keeps crashing is not hammered.
 #: Ports given on the command line (--candidate-port, repeatable): model
