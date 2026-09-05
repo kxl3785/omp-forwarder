@@ -336,7 +336,14 @@ class StudioPortNeverCandidateTests(RelayCase):
         # at Studio's port so only that candidate would otherwise win.
         fwd.CANDIDATE_PORTS = [studio.port]
         fwd.EXCLUDE_PORTS = {self.port, fwd.STUDIO_PORT}
-        out = raw_request(self.port, [b"GET /v1/models HTTP/1.1\r\n\r\n"])
+        # Stub the executable scan, as the other candidate tests do. Without
+        # this the relay discovers any REAL llama-server on the machine and
+        # relays to it with a 200: the test passed only on a box with no
+        # llama-server running, and failed the first time one was up.
+        with mock.patch.object(fwd, "_server_pids", return_value=set()), \
+                mock.patch.object(fwd, "_listening_ports",
+                                  return_value=[]):
+            out = raw_request(self.port, [b"GET /v1/models HTTP/1.1\r\n\r\n"])
         self.assertTrue(out.startswith(b"HTTP/1.1 503"))
         self.assertIn(b"Retry-After: 5", out)
         # Studio was never touched, so it cannot contribute a 401.
