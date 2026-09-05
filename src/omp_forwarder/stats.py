@@ -401,8 +401,10 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
   font-variant-numeric:tabular-nums}
 .gpus tr:last-child td{border-bottom:0}
 .gpus td:first-child{text-align:left;color:var(--dim);font-size:12px}
-.gpus tr.this td:first-child{color:var(--teal)}
-.gpus tr.this td:first-child::before{content:"\25B8 ";color:var(--teal)}
+/* The lane marker is plain text, never a glyph: an icon-font character
+   renders as a tofu box where the font is missing. The marker rides the
+   cell in the same small dim style as the other sub-labels. */
+.gpus .gmark{color:var(--dim);font-size:10px;margin-left:8px}
 .gpus .meter{height:4px;background:var(--panel2);border-radius:3px;
   overflow:hidden;border:1px solid var(--line);margin-top:0;width:90px;
   display:inline-block;vertical-align:middle;margin-left:8px}
@@ -454,6 +456,16 @@ PAGE = r"""<!doctype html>
 __HEADER_CSS__
 
 
+/* The status bar layout belongs to this page only: the usage page uses
+   .bar for its by-day rows, so these rules must not move into the
+   shared header fragment. */
+.bar{display:flex;flex-wrap:wrap;gap:24px;align-items:center;
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;
+  padding:12px 18px;margin-bottom:16px}
+.bit{display:flex;flex-direction:column;gap:1px;min-width:0}
+.bk{font-size:9.5px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
+.bv{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;
+  white-space:nowrap}
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:13px 16px 14px}
@@ -519,6 +531,9 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
 .facts .fv{font-family:var(--mono);font-size:13px;text-align:right;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .facts .fv.dim{color:var(--dim)}
+/* The Upstream fact can read a whole sentence ("candidate :30000 - prefer
+   llama-server"), so it spans the row instead of truncating in one cell. */
+.facts .row.full{grid-column:1/-1}
 /* Container controls: three quiet buttons next to the Container bit. */
 .ctl{display:inline-flex;gap:5px;margin-left:10px}
 .ctl button{appearance:none;background:transparent;border:1px solid var(--line);
@@ -529,16 +544,6 @@ h2 .rule{flex:1;height:1px;background:var(--line)}
 .ctl button.danger:hover{color:var(--red);border-color:var(--red);
   background:rgba(226,104,95,.07)}
 #ctl_msg{font-size:11px;color:var(--dim);margin-left:8px}
-/* Peer pills ride the tabs row, right-aligned. */
-.peers{display:flex;gap:6px;align-items:center}
-.peers a.lane{font-family:var(--mono);font-size:11px;color:var(--dim);
-  text-decoration:none;border:1px solid var(--line);border-radius:6px;
-  padding:2px 8px}
-.peers a.lane:hover{color:var(--teal);border-color:var(--teal)}
-.fname{font-family:var(--mono);font-size:13px;color:var(--dim);
-  margin-left:8px;font-weight:400}
-.tabsrow{display:flex;align-items:center;gap:16px;margin-top:10px}
-.tabsrow .peers{margin-left:auto}
 .pill{display:inline-block;font-family:var(--mono);font-size:11px;
   border:1px solid var(--line);background:transparent;border-radius:10px;
   padding:1px 7px;color:var(--dim);letter-spacing:.04em}
@@ -569,7 +574,7 @@ __HEADER__
   <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
   <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
   <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
-  <div class="row"><span class="fk">Upstream</span><span class="fv dim" id="f_up" title="How the current upstream was found; the configured preference">&mdash;</span></div>
+  <div class="row full"><span class="fk">Upstream</span><span class="fv dim" id="f_up" title="How the current upstream was found; the configured preference">&mdash;</span></div>
 </div>
 
 <h2 id="model_h">Model &mdash; live, from llama-server<span class="rule"></span>
@@ -586,7 +591,7 @@ __HEADER__
     <div class="v"><span id="pre">&mdash;</span><span class="u">tok/s</span></div>
     <div class="n" id="pre_n">prompt evaluation</div></div>
   <div class="card"><div class="k">Draft acceptance</div>
-    <div class="v"><span id="acc">&mdash;</span><span class="u">%</span></div>
+    <div class="v"><span id="acc">&mdash;</span><span class="u" id="acc_u">%</span></div>
     <div class="meter"><i id="acc_m"></i></div>
     <div class="n" id="acc_n">MTP speculation</div></div>
 </div>
@@ -787,17 +792,21 @@ async function tick(){
     $("dec").textContent="—"; $("dec_n").textContent=NP;
     $("pre").textContent="—"; $("pre_n").textContent=NP;
     // Draft acceptance: SGLang reports a length, not a percent.
-    // Show it as "tau 3.2" rather than as a percentage.
+    // Show it as "tau 3.2" without the % unit; the unit follows the
+    // value's meaning, so it is dropped here and restored for
+    // llama-server percentages below.
     if(s.sglang_spec_accept_length>0){
       $("acc").textContent="tau "+s.sglang_spec_accept_length.toFixed(1);
+      $("acc_u").textContent="";
       meterSet($("acc_m"),0,50,40);
       $("acc_n").textContent="spec accept length";
-    } else { $("acc").textContent="—"; $("acc_n").textContent=NP; }
+    } else { $("acc").textContent="—"; $("acc_u").textContent="";
+      $("acc_n").textContent=NP; }
   } else if(noMetrics){
     $("tput").textContent="—"; $("tput_n").textContent=NP;
     $("dec").textContent="—";  $("dec_n").textContent=NP;
     $("pre").textContent="—";  $("pre_n").textContent=NP;
-    $("acc").textContent="—";  $("acc_n").textContent=NP;
+    $("acc").textContent="—";  $("acc_u").textContent=""; $("acc_n").textContent=NP;
     meterSet($("acc_m"),0,50,40);
   } else if(prev){
     const dg=s.gen_tokens-prev.gen_tokens, dsec=s.gen_seconds-prev.gen_seconds;
@@ -841,11 +850,13 @@ async function tick(){
     let a=null, avg=false;
     if(dd>0){ a=100*da/dd; }
     else if(M.draft_total>0){ a=100*M.draft_accepted/M.draft_total; avg=true; }
-    if(a!=null){ $("acc").textContent=a.toFixed(1); meterSet($("acc_m"),a,50,40);
+    if(a!=null){ $("acc").textContent=a.toFixed(1); $("acc_u").textContent="%";
+      meterSet($("acc_m"),a,50,40);
       $("acc").className = a<40?"red":(a<50?"amber":"teal");
       $("acc_n").innerHTML = (a<40 ? "LOW — check for n-gram fallback" : "MTP speculation")
         + (avg ? (sess?'<span class="tag">session</span>':LIFE) : ""); }
-    else { $("acc").textContent="—"; $("acc_n").textContent="no drafts yet"; }
+    else { $("acc").textContent="—"; $("acc_u").textContent="";
+      $("acc_n").textContent="no drafts yet"; }
   }
 
   // --- server section: in flight, prompt cache, tokens per pass, largest ctx ---
@@ -900,12 +911,18 @@ async function tick(){
   const gnote=document.getElementById("gpus_n");
   if(s.gpus && s.gpus.length){
     const thisGpu=s.gpu;
+    // The lane marker is plain text: an icon-font glyph drew as a tofu box.
+    const lane=g=>{
+      if(g.index===thisGpu) return "this lane";
+      return (s.peers||[]).filter(pp=>pp.gpu===g.index)
+        .map(pp=>pp.name||("lane :"+pp.port)).join(" · ");
+    };
     const rows=s.gpus.map(g=>{
-      const gis=thisGpu!=null&&g.index===thisGpu;
       const mem=(g.mem_used_mib/1024).toFixed(1)+"/"+(g.mem_total_mib/1024).toFixed(1)+" GiB";
       const utilPct=Math.min(100,g.util_pct);
-      return `<tr class="${gis?"this":""}"><td>gpu ${g.index} · ${g.name}</td>`
-        +`<td>${mem}</td>`
+      const mark=lane(g);
+      return `<tr><td>gpu ${g.index} · ${g.name}`+(mark?` <span class="gmark">${mark}</span>`:"")
+        +`</td><td>${mem}</td>`
         +`<td>${g.util_pct}%<span class="meter"><i style="width:${utilPct}%"></i></span></td></tr>`;
     });
     gbox.innerHTML="<table><thead><tr><th>card</th><th>memory</th><th>util</th></tr></thead><tbody>"

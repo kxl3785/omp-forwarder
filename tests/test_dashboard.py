@@ -568,3 +568,59 @@ class SharedHeaderTests(ForwarderCase):
         from omp_forwarder import usage
         self.assertIn('id="peers"', usage.PAGE)
         self.assertIn('svg class="mark"', usage.PAGE)
+
+
+# ----------------------------------------------------------------
+# 8. Page markup: what a browser renders before any JavaScript runs
+#    (regressions found by rendering both pages live)
+# ----------------------------------------------------------------
+
+class PageMarkupTests(ForwarderCase):
+    """The HTML/CSS shipped in the PAGE strings."""
+
+    def test_status_bar_css_present(self):
+        # The bar must be a labelled grid, not bare text lines. The rules
+        # live in the stats page's CSS, not the shared fragment: the usage
+        # page uses .bar for its by-day rows.
+        self.assertIn(".bar{display:flex", stats.PAGE)
+        self.assertIn(".bit{display:flex", stats.PAGE)
+        self.assertIn(".bk{font-size:9.5px", stats.PAGE)
+        self.assertIn(".bv{font-family:var(--mono)", stats.PAGE)
+        self.assertNotIn(".bar{", stats._HEADER_CSS)
+
+    def test_lane_marker_is_plain_text(self):
+        # An icon-font glyph draws as a tofu box where the font is missing;
+        # the lane marker is plain text in the gmark class instead.
+        from omp_forwarder import usage
+        for page in (stats.PAGE, usage.PAGE):
+            self.assertNotIn("\\25B8", page)
+        self.assertIn(".gpus .gmark", stats.PAGE)
+        self.assertIn('"this lane"', stats.PAGE)
+
+    def test_usage_page_carries_no_header_css_of_its_own(self):
+        # The shared fragment owns the header. A private copy used to win
+        # over it and push the tabs to the top right.
+        from omp_forwarder import usage
+        self.assertNotIn(".head{display:flex", usage.PAGE)
+        self.assertNotIn("justify-content:space-between", usage.PAGE)
+        # Exactly one .tabs rule: the shared one.
+        self.assertEqual(usage.PAGE.count(".tabs a.on"), 1)
+
+    def test_usage_page_fills_the_shared_header(self):
+        # The usage page must fill lane name and peer pills from the same
+        # snapshot as the live dashboard.
+        from omp_forwarder import usage
+        self.assertIn('$("fname")', usage.PAGE)
+        self.assertIn('$("peers")', usage.PAGE)
+
+    def test_draft_acceptance_unit_follows_value(self):
+        # The % unit needs an id so the page can drop it when the value is
+        # SGLang's accept length ("tau 3.2") rather than a percentage.
+        self.assertIn('id="acc_u"', stats.PAGE)
+        self.assertIn('$("acc_u").textContent="%"', stats.PAGE)
+
+    def test_upstream_fact_spans_full_row(self):
+        # The Upstream value reads kind and preference in full; the row
+        # spans the facts grid instead of truncating.
+        self.assertIn(".facts .row.full", stats.PAGE)
+        self.assertIn('class="row full"', stats.PAGE)

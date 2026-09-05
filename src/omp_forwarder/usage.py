@@ -31,35 +31,15 @@ PAGE = r"""<!doctype html>
 <style>
 __HEADER_CSS__
 
-*{box-sizing:border-box}
-/* Reserve the scrollbar even when the page is short, so switching
-   between the two pages cannot shift the layout sideways. */
-html{scrollbar-gutter:stable}
-/* Body padding and wrap width match the live dashboard exactly. They used to
-   differ, and switching pages then slid the whole layout sideways. */
-body{margin:0;background:var(--bg);color:var(--ink);
-  font:14px/1.5 ui-sans-serif,-apple-system,"Segoe UI",system-ui,sans-serif;
-  padding:26px 24px 40px;-webkit-font-smoothing:antialiased}
-.wrap{max-width:1060px;margin:0 auto}
-/* Deliberately identical to the live dashboard's header: same title, same
-   mark, same switch in the same place. Switching pages then moves nothing on
-   screen except which tab is lit. */
-h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
-  display:flex;align-items:center;gap:11px}
-.mark{width:22px;height:22px;flex:none}
-.head{display:flex;align-items:center;justify-content:space-between;gap:18px}
-.tabs{display:flex;border:1px solid var(--line);border-radius:8px;
-  overflow:hidden;background:var(--panel2);flex:none}
-.tabs a{color:var(--dim);text-decoration:none;font-size:12px;padding:6px 15px;
-  line-height:1.5}
-.tabs a+a{border-left:1px solid var(--line)}
-.tabs a:hover{color:var(--ink)}
-.tabs a.on{color:var(--teal);background:var(--panel)}
+/* The header, lane name, peer pills and tab switch come from the shared
+   fragment injected above; the live dashboard carries the same one. Do not
+   restyle the header here: an older private copy of these rules used to
+   win over the shared ones and push the tabs to the top right. */
 h2{font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--dim);
   font-weight:600;margin:30px 0 12px;display:flex;align-items:center;gap:12px}
 h2 .rule{flex:1;height:1px;background:var(--line)}
 h2 .note{color:var(--dim);font-weight:400;letter-spacing:0;text-transform:none;font-size:11.5px}
-.sub{margin:5px 0 20px;color:var(--dim);font-size:13px}
+
 .grid{display:grid;gap:11px;grid-template-columns:repeat(auto-fit,minmax(180px,1fr))}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:13px 15px 14px}
@@ -282,6 +262,27 @@ async function tick(){
   catch(e){ if(++missed>2) document.body.classList.add("stale"); return; }
   missed=0; document.body.classList.remove("stale");
   last=s; render(s);
+
+  // --- Lane identity: the shared header is filled from the same snapshot on
+  //     both pages, so the lane name and the peer pills render identically.
+  //     The live dashboard does the same thing; keeping the code identical
+  //     is what stops the two headers drifting apart.
+  if(s.name){ $("fname").textContent="· "+s.name; }
+  else { $("fname").textContent=""; }
+  const pb=$("peers");
+  if(s.peers && s.peers.length){
+    pb.innerHTML=s.peers.map(pp=>{
+      const name=pp.name?("lane "+pp.name):("lane :"+pp.port);
+      const fx=pp.reachable
+        ? ((pp.engine&&pp.engine!=="unknown"?" "+pp.engine:"")
+           +((pp.thinking&&pp.thinking!=="unknown")?(" · "+pp.thinking):""))
+        : " unreachable";
+      const dot=pp.healthy?"on":"off";
+      return `<a class="lane" href="http://127.0.0.1:${pp.port}/__stats" target="_blank">`
+        +`<span class="pdot ${dot}"></span><span>${name}</span>`
+        +`<span class="pfx">${fx}</span></a>`;
+    }).join("");
+  } else { pb.innerHTML=""; }
 }
 tick(); setInterval(tick,5000);
 </script>
