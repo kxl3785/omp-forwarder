@@ -463,6 +463,9 @@ __HEADER_CSS__
   background:var(--panel);border:1px solid var(--line);border-radius:12px;
   padding:12px 18px;margin-bottom:16px}
 .bit{display:flex;flex-direction:column;gap:1px;min-width:0}
+/* .bit sets display, which beats the hidden attribute's default; without
+   this the Container bit shows an empty label on a lane with no container. */
+.bit[hidden]{display:none}
 .bk{font-size:9.5px;letter-spacing:.1em;color:var(--dim);text-transform:uppercase}
 .bv{font-family:var(--mono);font-size:13px;overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
@@ -561,7 +564,7 @@ __HEADER__
   <div class="bit"><span class="bk">Status</span><span class="bv"><span class="dot off" id="dot"></span><span id="state">connecting</span></span></div>
   <div class="bit" style="flex:1"><span class="bk">Model</span><span class="bv" id="model">&mdash;</span></div>
   <div class="bit"><span class="bk">Uptime</span><span class="bv" id="uptime">&mdash;</span></div>
-  <div class="bit"><span class="bk">Container</span><span class="bv" id="cont" title="">&mdash;</span><span class="ctl" id="ctl"><button data-act="start">start</button><button data-act="stop">stop</button><button data-act="restart" class="danger">restart</button></span><span id="ctl_msg"></span></span></div>
+  <div class="bit" id="contbit" hidden><span class="bk">Container</span><span class="bv" id="cont" title="">&mdash;</span><span class="ctl" id="ctl"><button data-act="start">start</button><button data-act="stop">stop</button><button data-act="restart" class="danger">restart</button></span><span id="ctl_msg"></span></span></div>
   <button class="rst" id="rst-all" title="Reset every section to start from now">
     <svg><use href="#ico-rst"/></svg>Reset all</button>
 </div>
@@ -751,6 +754,9 @@ async function tick(){
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.healthy?"on":"off");
   $("state").textContent=s.healthy?"ready":(s.upstream?"unreachable":"no direct server");
+  // The whole Container bit, label included, exists only in container mode.
+  // A lane fronting a plain llama-server showed an empty "CONTAINER" label.
+  $("contbit").hidden=!s.container_name;
   if(s.container_name){
     $("cont").textContent=s.container_name+" · "+(s.container||"unknown");
     $("cont").title="container "+s.container_name+" in WSL distro; status: "+(s.container||"unknown");
