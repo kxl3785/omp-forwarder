@@ -554,7 +554,9 @@ class SharedHeaderTests(ForwarderCase):
         self.assertIn("var(--bg)", stats.PAGE)
 
     def test_stats_page_contains_header_html(self):
-        self.assertIn('id="peers"', stats.PAGE)
+        # The stats page dropped its peer pill: the Lanes panel lists every
+        # lane with its state and its buttons, so a second list was noise.
+        self.assertIn('id="lanes"', stats.PAGE)
         self.assertIn('id="fname"', stats.PAGE)
         self.assertIn('svg class="mark"', stats.PAGE)
 

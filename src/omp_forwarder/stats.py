@@ -690,7 +690,7 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .ftab .pill{padding:1px 6px;border-radius:8px;font-size:11px}
 .recent .rk{color:var(--dim);font-size:10px;letter-spacing:.08em;
   text-transform:uppercase;margin-bottom:6px}
-.lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1.5fr) minmax(0,2fr) auto minmax(80px,auto);
+.lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1fr) auto minmax(80px,auto);
   gap:14px;align-items:center;padding:10px 14px;background:var(--panel);border:1px solid var(--line);
   border-radius:8px;font-family:var(--mono);font-size:12px}
 .lane.self{border-color:var(--teal)}
@@ -699,9 +699,8 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .lane .ln a:hover{text-decoration:underline}
 .lane .lg{color:var(--dim)}
 .lane .lp.ok{color:var(--green)} .lane .lp.warn{color:var(--amber)} .lane .lp.dim{color:var(--dim)} .lane .lp.bad{color:var(--red)}
-.lane .lm{color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .lane .ctl{justify-content:flex-end}
-@media (max-width:900px){.lane{grid-template-columns:1fr 1fr;} .lane .lm{display:none}}
+@media (max-width:900px){.lane{grid-template-columns:1fr 1fr}}
 /* GPU panel: one row per card, the matching lane marked. */
 .gpus{background:var(--panel);border:1px solid var(--line);border-radius:12px;
   overflow:hidden}
@@ -741,8 +740,8 @@ _HEADER_HTML = """<div class="head">
 <span>omp forwarder</span><span class="fname" id="fname"></span></h1>
 <div class="tabsrow">
 <nav class="tabs">{tabs}</nav>
-<div class="peers" id="peers"></div>
 </div>
+<div class="peers" id="peers"></div>
 </div>"""
 
 _SVG_SYMBOLS = """<svg style="display:none">
@@ -878,8 +877,6 @@ __HEADER__
   <div class="bit"><span class="bk">Status</span><span class="bv"><span class="dot off" id="dot"></span><span id="state">connecting</span></span></div>
   <div class="bit" style="flex:1"><span class="bk">Model</span><span class="bv" id="model">&mdash;</span></div>
   <div class="bit"><span class="bk">Uptime</span><span class="bv" id="uptime">&mdash;</span></div>
-  <div class="bit" id="contbit" hidden><span class="bk">Container</span><span class="bv" id="cont" title="">&mdash;</span><span class="ctl"><button data-act="start">start</button><button data-act="stop">stop</button><button data-act="restart" class="danger">restart</button></span><span class="ctl_msg"></span></div>
-  <div class="bit" id="procbit" hidden><span class="bk">Upstream process</span><span class="bv" id="proc" title="">&mdash;</span><span class="ctl"><button data-act="start" data-needs-cmd>start</button><button data-act="stop" class="danger">stop</button><button data-act="restart" class="danger" data-needs-cmd>restart</button></span><span class="ctl_msg"></span></div>
   <button class="rst" id="rst-all" title="Reset every section to start from now">
     <svg><use href="#ico-rst"/></svg>Reset all</button>
 </div>
@@ -1055,15 +1052,22 @@ async function tick(){
   const engine = (s.facts||{}).engine || "unknown";
   const engineSuffix = engine==="llama-server" ? "llama-server"
                       : engine==="sglang"       ? "SGLang" : "upstream";
+  const manyLanes=((s.fleet&&s.fleet.lanes)||1)>1;
+  // The peer pill belongs to the shared header, which the Usage page also
+  // uses. This page has the Lanes panel instead, so the pill is hidden here
+  // rather than removed from the fragment.
+  const pillEl=document.getElementById("peers");
+  if(pillEl) pillEl.style.display="none";
   const modelH=$("model_h");
-  modelH.childNodes[0].textContent =
-    "Model — live, from "+engineSuffix+" ";
+  modelH.childNodes[0].textContent = manyLanes
+    ? "Model — live, all lanes " : ("Model — live, from "+engineSuffix+" ");
   const subEl=document.querySelector(".sub");
-  subEl.innerHTML = "Traffic omp sends straight to "+engineSuffix
+  subEl.innerHTML = (manyLanes ? "Traffic omp sends straight to your model servers"
+                               : ("Traffic omp sends straight to "+engineSuffix))
     + " &mdash; the requests Unsloth&rsquo;s own API panel cannot see.";
   const slotsSrc=$("slots_src");
   slotsSrc.textContent = engine==="llama-server" ? "from /slots"
-    : "not provided by this upstream";
+    : (manyLanes ? "per lane" : "not provided by this engine");
 
   // --- bar ---
   const nl=(s.fleet&&s.fleet.lanes)||1;
@@ -1078,26 +1082,6 @@ async function tick(){
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.healthy?"on":"off");
   $("state").textContent=s.healthy?"ready":(s.upstream?"unreachable":"no server");
-  // The whole Container bit, label included, exists only in container mode.
-  // A lane fronting a plain llama-server showed an empty "CONTAINER" label.
-  $("contbit").hidden=!s.container_name;
-  const latched=s.operator_stopped?" · stopped by operator":"";
-  if(s.container_name){
-    $("cont").textContent=s.container_name+" · "+(s.container||"unknown")+latched;
-    $("cont").title="container "+s.container_name+" in WSL distro; status: "+(s.container||"unknown");
-  } else {
-    $("cont").textContent=""; $("cont").title="";
-  }
-  // Process lane: shown when the scan knows the upstream's PID or a start
-  // command exists, and never beside a container. start/restart need the
-  // command; stop needs only the PID.
-  const proc=!s.container_name && (s.upstream_pid || s.upstream_cmd);
-  $("procbit").hidden=!proc;
-  if(proc){
-    $("proc").textContent=(s.upstream_pid?("pid "+s.upstream_pid):"not running")+latched;
-    $("proc").title=s.upstream_cmd?"start runs --upstream-cmd on the host":"no --upstream-cmd: stop only";
-    document.querySelectorAll("#procbit [data-needs-cmd]").forEach(b=>{ b.hidden=!s.upstream_cmd; });
-  }
 
   // --- forwarder-only cards: always live ---
   const tok=F.tok_prompt+F.tok_gen;
@@ -1127,7 +1111,7 @@ async function tick(){
   if(p50n) p50n.textContent = s.p50_is_slowest_lane ? "median, slowest lane" : "median, last 200";
 
   // --- model section: throughput, decode, prefill, draft ---
-  const NP = "not provided by this upstream";
+  const NP = "not provided by this engine";
   if(engine==="sglang" && s.metrics_available){
     // SGLang exposes different metric names; map onto the same cards.
     // Throughput is a live gauge (tok/s), not a counter to difference.
@@ -1286,7 +1270,7 @@ async function tick(){
   // --- per-stream table: render or show not-provided ---
   if(noMetrics){
     const box=document.getElementById("slots");
-    box.innerHTML='<div class="quiet">not provided by this upstream</div>';
+    box.innerHTML='<div class="quiet">not provided by this engine</div>';
     document.getElementById("slots_n").textContent="";
   } else if(!prev){
     renderSlots(s);
@@ -1297,20 +1281,6 @@ async function tick(){
     $("pg_title").textContent="omp forwarder · "+s.name; }
   else { $("fname").textContent="";
     $("pg_title").textContent="omp forwarder"; }
-  const pb=$("peers");
-  if(s.peers && s.peers.length){
-    pb.innerHTML=s.peers.map(pp=>{
-      const name=pp.name?("lane "+pp.name):("lane :"+pp.port);
-      const fx=pp.reachable
-        ? ((pp.engine&&pp.engine!=="unknown"?" "+pp.engine:"")
-           +((pp.thinking&&pp.thinking!=="unknown")?(" · "+pp.thinking):""))
-        : " unreachable";
-      const dot=pp.healthy?"on":"off";
-      return `<a class="lane" href="http://127.0.0.1:${pp.port}/__stats" target="_blank">`
-        +`<span class="pdot ${dot}"></span><span>${name}</span>`
-        +`<span class="pfx">${fx}</span></a>`;
-    }).join("");
-  } else { pb.innerHTML=""; }
 
 
   // --- deployment facts ---
@@ -1380,7 +1350,7 @@ async function tick(){
       const btns=(l.presets||[]).map(p=>'<button data-act="assign" data-preset="'+esc(p)+'"'+ln+'>'+esc(p)+'</button>').join("")
         +'<button data-act="stop" class="danger"'+ln+'>unload</button>';
       return '<div class="lane'+(l.self?" self":"")+'" data-port="'+esc(l.port)+'"><span class="ln"></span><span class="lg"></span>'
-        +'<span class="lp"></span><span class="lm"></span><span class="ctl">'+btns+'</span><span class="ctl_msg"></span></div>';
+        +'<span class="lp"></span><span class="ctl">'+btns+'</span><span class="ctl_msg"></span></div>';
     }).join("");
     lanesEl.dataset.built=lkey; wireCtl(lanesEl);
   }
@@ -1393,7 +1363,6 @@ async function tick(){
     const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"failed \u00b7 not running"))):"none assigned");
     const lp=row.querySelector(".lp"); lp.textContent=(l.preset||"\u2014")+" \u00b7 "+st;
     lp.className="lp "+(st==="serving"?"ok":(st==="loading\u2026"?"warn":(st==="unreachable"||st.startsWith("failed")?"bad":"dim")));
-    row.querySelector(".lm").textContent=l.model||"";
     row.querySelectorAll("button").forEach(b=>{
       b.disabled=!!l.loading||!l.reachable;
       if(b.dataset.act==="assign") b.classList.toggle("on", b.dataset.preset===l.preset && !l.operator_stopped && !!l.healthy);
@@ -1417,12 +1386,6 @@ async function tick(){
     upEl.classList.remove("dim");
   } else { upEl.innerHTML="&mdash;"; upEl.classList.add("dim"); }
   }
-
-  // --- control buttons: only visible when container mode is on ---
-  const ctl=$("ctl");
-  if(s.container_name && s.control_token){
-    ctl.style.display="";
-  } else { ctl.style.display="none"; }
 
   // --- dim metric cards when /metrics is unavailable ---
   if(!s.metrics_available){
