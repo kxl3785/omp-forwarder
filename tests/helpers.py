@@ -131,6 +131,12 @@ def reset_state() -> None:
     fwd._preset = None
     fwd._saved_state = {}
     fwd._container_monitor_started = True  # never start the real thread in tests
+    # Nor the /slots stream watcher; tests drive note_slots directly.
+    from omp_forwarder import stats as _stats_mod
+    _stats_mod._watcher_started = True
+    _stats_mod._stream_hist.clear()
+    _stats_mod._recent_streams.clear()
+    _stats_mod._seeded = True   # tests record from the first sample
 
 
 class FakeUpstream:

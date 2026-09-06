@@ -393,3 +393,91 @@ class LaunchFailedTests(ForwarderCase):
         s = stats.snapshot(fwd, dict(fwd._stats))
         self.assertFalse(s["launch_failed"])
         self.assertFalse(s["loading"])
+
+
+def _slot(sid, task, decoded, prompt=100, cached=0, busy=True):
+    return {"id": sid, "task": task, "decoded": decoded, "prompt": prompt,
+            "cached": cached, "busy": busy}
+
+
+class RecentStreamTests(ForwarderCase):
+    """Finished streams are kept, so the panel shows traffic between bursts.
+    A slot keeps its last task and token count after release, so a stream
+    that ran entirely between two samples is still recorded."""
+
+    def test_a_stream_watched_to_the_end_reports_its_average_rate(self):
+        stats.note_slots([_slot(0, 7, 10)], 100.0)
+        stats.note_slots([_slot(0, 7, 210)], 102.0)
+        stats.note_slots([_slot(0, 8, 0, busy=False)], 103.0)
+        r = stats.recent_streams(8890)
+        self.assertEqual((r[0]["slot"], r[0]["tokens"], r[0]["lane"]), (0, 210, 8890))
+        self.assertEqual((r[0]["seconds"], r[0]["rate"]), (2.0, 105.0))
+
+    def test_a_stream_that_ran_between_samples_is_still_recorded(self):
+        # Never seen busy: at the next sample the slot is idle and already
+        # carries the finished task's id and its final token count.
+        stats.note_slots([_slot(0, 7, 40, busy=False)], 100.0)
+        stats.note_slots([_slot(0, 9, 88, busy=False)], 101.0)
+        r = stats.recent_streams(8890)
+        self.assertEqual([(x["tokens"], x["rate"]) for x in r], [(88, None), (40, None)])
+
+    def test_the_first_sample_only_seeds(self):
+        # A live forwarder starts with every slot already carrying the task
+        # it last ran, months of uptime ago. Those are history, not traffic.
+        stats._seeded = False
+        stats.note_slots([_slot(0, 7, 40, busy=False)], 100.0)
+        self.assertEqual(stats.recent_streams(8890), [])
+        stats.note_slots([_slot(0, 9, 88, busy=False)], 101.0)
+        self.assertEqual([x["tokens"] for x in stats.recent_streams(8890)], [88])
+
+    def test_each_slot_reports_without_waiting_for_new_work(self):
+        # Three requests over three slots, none of which is used again.
+        # The first version only recorded a stream when its slot took new
+        # work, so two of these were never seen.
+        stats.note_slots([_slot(0, 1, 5), _slot(1, 2, 5), _slot(2, 3, 5)], 100.0)
+        stats.note_slots([_slot(0, 1, 30, busy=False),
+                          _slot(1, 2, 40, busy=False),
+                          _slot(2, 3, 50, busy=False)], 101.0)
+        r = stats.recent_streams(8890)
+        self.assertEqual(sorted(x["tokens"] for x in r), [30, 40, 50])
+
+    def test_a_new_task_on_the_same_slot_ends_the_old_stream(self):
+        stats.note_slots([_slot(0, 7, 100)], 100.0)
+        stats.note_slots([_slot(0, 9, 5)], 101.0)
+        r = stats.recent_streams(8890)
+        self.assertEqual([(x["slot"], x["tokens"]) for x in r], [(0, 100)])
+
+    def test_the_same_stream_is_recorded_once(self):
+        stats.note_slots([_slot(0, 7, 50, busy=False)], 100.0)
+        for i in range(4):
+            stats.note_slots([_slot(0, 7, 50, busy=False)], 101.0 + i)
+        self.assertEqual(len(stats.recent_streams(8890)), 1)
+
+    def test_a_stream_that_generated_nothing_is_not_recorded(self):
+        stats.note_slots([_slot(0, 7, 0)], 100.0)
+        stats.note_slots([_slot(0, 8, 0, busy=False)], 101.0)
+        self.assertEqual(stats.recent_streams(8890), [])
+
+    def test_newest_first_and_capped(self):
+        for i in range(15):
+            stats.note_slots([_slot(0, i, 10, busy=False)], 100.0 + i)
+        r = stats.recent_streams(8890)
+        self.assertEqual(len(r), 12)
+        self.assertGreater(r[0]["ended"], r[-1]["ended"])
+
+    def test_snapshot_carries_them(self):
+        stats.note_slots([_slot(1, 3, 50, busy=False)], 10.0)
+        stats.note_slots([_slot(1, 4, 0, busy=False)], 11.0)
+        fwd.LISTEN_PORT = 8890
+        d = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertEqual([(x["slot"], x["lane"]) for x in d["recent_streams"]], [(1, 8890)])
+
+class RecentMergeTests(ForwarderCase):
+
+    def test_merge_interleaves_lanes_newest_first(self):
+        own = {"listen": 8890, "slots": [], "days": [], "healthy": False,
+               "recent_streams": [{"slot": 0, "lane": 8890, "ended": 5.0, "tokens": 1}]}
+        peer = {"listen": 8891, "slots": [], "days": [], "healthy": False,
+                "recent_streams": [{"slot": 0, "lane": 8891, "ended": 9.0, "tokens": 2}]}
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual([x["lane"] for x in m["recent_streams"]], [8891, 8890])

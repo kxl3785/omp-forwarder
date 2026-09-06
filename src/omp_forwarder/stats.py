@@ -37,7 +37,117 @@ import urllib.request
 #: Fallback only. This module is imported lazily, on the first /__stats hit,
 #: so its own import time is not the forwarder's start time -- the forwarder
 #: passes the real one in stats["started"].
+import collections
+import threading
+
 _STARTED = time.time()
+
+#: Finished streams, newest last. A slot is busy only while it generates,
+#: and the page polls every 3 s, so every request shorter than that was
+#: invisible: the panel read "4 slots idle" through a working agent loop.
+#: A watcher thread samples /slots every second while anything is busy and
+#: keeps what finished, so the panel can show traffic between bursts.
+_stream_hist: dict = {}
+_recent_streams: collections.deque = collections.deque(maxlen=12)
+_watcher_started = False
+#: The first sample only seeds: every slot already carries the id_task of
+#: whatever it last ran, and those are history, not new traffic.
+_seeded = False
+
+
+def note_slots(slots: list, now: float) -> None:
+    """Fold one /slots sample into the recent-stream record.
+
+    Watching only BUSY slots missed most real traffic: an agent turn can
+    finish in 0.6 s and no sampler at a sane cadence sees it running. But
+    llama-server keeps a released slot's id_task and its final n_decoded
+    until that slot takes new work, so a finished stream stays readable
+    after the fact. Every slot is tracked, busy or idle, and a stream is
+    recorded the first sample it is seen idle -- not when its slot is next
+    used, which would lose every stream that landed on a slot nothing else
+    touched again.
+
+    n_decoded restarts with each task, so the task id is the only safe
+    identity. A duration is real only if the stream was seen busy at two
+    samples; otherwise the token count stands alone and the rate is None."""
+    global _seeded
+    for sl in slots or []:
+        sid, task = sl.get("id"), sl.get("task")
+        dec = sl.get("decoded", 0) or 0
+        busy = bool(sl.get("busy"))
+        h = _stream_hist.get(sid)
+        if h is None or h["task"] != task:
+            # A different task: whatever this slot held has finished. It is
+            # recorded here only if it was never recorded on going idle.
+            if h is not None and not h.get("seed") and not h.get("done"):
+                _finish(sid, h)
+            h = {"task": task, "decoded": dec, "prompt": sl.get("prompt", 0),
+                 "cached": sl.get("cached", 0), "t0": now, "t": now,
+                 "seen": 1 if busy else 0,
+                 # The task a slot happens to carry when this watcher starts
+                 # finished before anyone was looking. Seeds never report.
+                 "seed": not _seeded, "done": False}
+            _stream_hist[sid] = h
+        else:
+            if dec >= h["decoded"]:
+                h["decoded"] = dec
+                h["prompt"] = sl.get("prompt", h["prompt"])
+                h["cached"] = sl.get("cached", h["cached"])
+            if busy:
+                h["t"] = now
+                h["seen"] += 1
+        if not busy and not h["done"] and not h["seed"]:
+            _finish(sid, h)
+            h["done"] = True
+    _seeded = True
+
+
+def _finish(sid, h) -> None:
+    if h["decoded"] <= 0:
+        return
+    secs = h["t"] - h["t0"]
+    # One sample means the token count is real and the duration is not.
+    rate = round(h["decoded"] / secs, 1) if (h["seen"] >= 2 and secs >= 1.0) else None
+    _recent_streams.append({
+        "slot": sid, "tokens": h["decoded"],
+        "seconds": round(max(secs, 0.0), 1) if rate is not None else None,
+        "rate": rate, "prompt": h["prompt"], "cached": h["cached"],
+        "ended": h["t"],
+    })
+
+
+def recent_streams(lane) -> list:
+    """The finished streams, newest first, each tagged with its lane."""
+    return [dict(r, lane=lane) for r in reversed(_recent_streams)]
+
+
+def _stream_watcher(fwd) -> None:
+    """Sample /slots once a second while anything is busy, three seconds
+    otherwise. Never on the request path; a dead or unhealthy upstream is
+    not asked at all (a closed loopback port costs a 2 s timeout here)."""
+    while True:
+        busy = False
+        try:
+            if getattr(fwd, "_upstream_healthy", False):
+                sl = upstream_slots(getattr(fwd, "_upstream", None))
+                busy = any(x.get("busy") for x in sl)
+                note_slots(sl, time.time())
+        except Exception:
+            pass
+        # A constant second, busy or not. The first version slept 3 s while
+        # idle and so missed every request shorter than that -- which is the
+        # exact case this list exists to show. One /slots read per second on
+        # loopback is cheap; an unhealthy upstream is not read at all.
+        time.sleep(1.0)
+
+
+def ensure_stream_watcher(fwd) -> None:
+    global _watcher_started
+    if _watcher_started:
+        return
+    _watcher_started = True
+    threading.Thread(target=_stream_watcher, args=(fwd,), daemon=True).start()
+
 
 
 def parse_metrics(text: str) -> dict:
@@ -261,6 +371,11 @@ def merge_snapshots(own: dict, peers: list) -> dict:
             row["id"] = f"{port}:{sl.get('id')}"
             slots.append(row)
     out["slots"] = slots
+    recent = []
+    for l in lanes:
+        recent.extend(l.get("recent_streams") or [])
+    recent.sort(key=lambda r: r.get("ended") or 0, reverse=True)
+    out["recent_streams"] = recent[:12]
     out["healthy"] = any(bool(l.get("healthy")) for l in lanes)
     out["live"] = any(bool(l.get("live")) for l in lanes)
     out["metrics_available"] = any(bool(l.get("metrics_available")) for l in lanes)
@@ -326,6 +441,7 @@ def snapshot(fwd, stats: dict) -> dict:
     g = m.get
     slots = upstream_slots(port) if live else []
     # The keepalive child's pid when container mode is on, else None.
+    ensure_stream_watcher(fwd)
     _ka = getattr(fwd, "_container_keepalive", None)
     keepalive_pid = _ka.pid if _ka is not None else None
     return {
@@ -463,6 +579,8 @@ def snapshot(fwd, stats: dict) -> dict:
         "sglang_requests_total": g("sglang:num_requests_total", 0),
         # Per-stream, from /slots. /metrics cannot give this.
         "slots": slots,
+        # Streams that finished, so the panel says something between bursts.
+        "recent_streams": recent_streams(getattr(fwd, "LISTEN_PORT", None)),
     }
 
 
@@ -516,6 +634,9 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .peers .pfx{color:var(--dim);font-size:10px}
 /* Lanes panel: one row per card, this lane first. */
 .lanes{display:flex;flex-direction:column;gap:6px;margin-bottom:22px}
+.recent{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.recent .rk{color:var(--dim);font-size:10px;letter-spacing:.08em;
+  text-transform:uppercase;margin-bottom:6px}
 .lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1.5fr) minmax(0,2fr) auto minmax(80px,auto);
   gap:14px;align-items:center;padding:10px 14px;background:var(--panel);border:1px solid var(--line);
   border-radius:8px;font-family:var(--mono);font-size:12px}
@@ -1222,6 +1343,28 @@ function meterSet(el,pct,warn,bad){el.style.width=Math.max(0,Math.min(100,pct))+
 const slotHist=new Map();
 // Returns {decoding, prefilling, total, haveRate} so the Throughput card can
 // use the same per-stream rates instead of the completion-based counter.
+// Streams that have finished. A slot is busy only while it generates and
+// the page polls every 3 s, so short agent turns leave no live trace; this
+// is what shows the panel is working between bursts.
+function recentHtml(s){
+  const r=s.recent_streams||[];
+  if(!r.length) return "";
+  const ago=t=>{const d=Math.max(0,Math.round(s.t-t));
+    return d<60?(d+"s ago"):(Math.round(d/60)+"m ago");};
+  return '<div class="recent"><div class="rk">recent</div><table><thead><tr>'
+    +"<th>stream</th><th>finished</th><th>tok/s</th><th>generated</th>"
+    +"<th>context</th><th>cached</th><th>took</th></tr></thead><tbody>"
+    +r.map(x=>"<tr>"
+      +`<td>${x.lane!=null?('<span class="dim">:'+x.lane+' \u00b7 </span>'):""}slot ${x.slot}</td>`
+      +`<td class="dim">${ago(x.ended)}</td>`
+      +`<td class="rate">${x.rate==null?'<span class="dim">\u2014</span>':fmt(x.rate)}</td>`
+      +`<td>${Math.round(x.tokens).toLocaleString()}</td>`
+      +`<td>${Math.round(x.prompt).toLocaleString()}</td>`
+      +`<td>${x.prompt>0?Math.round(100*x.cached/x.prompt)+"%":'<span class="dim">\u2014</span>'}</td>`
+      +`<td class="dim">${x.seconds==null?"":(x.seconds+"s")}</td>`
+      +"</tr>").join("")
+    +"</tbody></table></div>";
+}
 function renderSlots(s){
   const rows=[], slots=(s.slots||[]).filter(x=>x.busy);
   let total=0, haveRate=false, decoding=0, prefilling=0;
@@ -1266,7 +1409,7 @@ function renderSlots(s){
   const note=document.getElementById("slots_n");
   const out={decoding,prefilling,total,haveRate};
   if(!rows.length){
-    box.innerHTML='<div class="quiet">no stream is generating</div>';
+    box.innerHTML='<div class="quiet">no stream is generating</div>'+recentHtml(s);
     note.textContent = (s.slots||[]).length ? ((s.slots||[]).length+" slots idle") : "";
     return out;
   }
@@ -1281,7 +1424,7 @@ function renderSlots(s){
        ? '<tfoot><tr><td>aggregate</td><td class="dim">decode</td>'
          +`<td class="rate">${total.toFixed(1)}</td><td colspan="4"></td></tr></tfoot>`
        : "")
-    +"</table>";
+    +"</table>"+recentHtml(s);
   return out;
 }
 // Control buttons: POST to /__control with the token from the last sample.
