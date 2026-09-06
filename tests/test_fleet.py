@@ -517,3 +517,35 @@ class LaneRowTests(ForwarderCase):
                 "lane_rows": [{"lane": 8891, "engine": "sglang", "rate": 161.7}]}
         m = stats.merge_snapshots(own, [peer])
         self.assertEqual([r["lane"] for r in m["lane_rows"]], [8891])
+
+
+class LaneFactsTests(ForwarderCase):
+    """The Deployment panel describes every lane, not just the page opened."""
+
+    def test_snapshot_carries_this_lane_facts(self):
+        fwd.LISTEN_PORT = 8890
+        fwd.FWD_NAME, fwd.FWD_GPU = "GPU 0", 0
+        fwd._upstream_facts = {"engine": "llama-server", "thinking": "on"}
+        d = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertEqual(len(d["lane_facts"]), 1)
+        lf = d["lane_facts"][0]
+        self.assertEqual((lf["lane"], lf["name"], lf["gpu"]), (8890, "GPU 0", 0))
+        self.assertEqual(lf["facts"]["engine"], "llama-server")
+
+    def test_merge_collects_every_lane_and_marks_the_median(self):
+        own = {"listen": 8890, "slots": [], "days": [], "healthy": True,
+               "latency_p50_ms": 100.0,
+               "lane_facts": [{"lane": 8890, "facts": {"engine": "llama-server"}}]}
+        peer = {"listen": 8891, "slots": [], "days": [], "healthy": True,
+                "latency_p50_ms": 900.0,
+                "lane_facts": [{"lane": 8891, "facts": {"engine": "sglang"}}]}
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual([f["lane"] for f in m["lane_facts"]], [8890, 8891])
+        self.assertTrue(m["p50_is_slowest_lane"])
+        self.assertEqual(m["latency_p50_ms"], 900.0)
+
+    def test_one_lane_is_not_marked(self):
+        own = {"listen": 8890, "slots": [], "days": [], "healthy": True,
+               "lane_facts": [{"lane": 8890, "facts": {}}]}
+        m = stats.merge_snapshots(own, [])
+        self.assertFalse(m.get("p50_is_slowest_lane"))

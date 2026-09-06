@@ -384,6 +384,14 @@ def merge_snapshots(own: dict, peers: list) -> dict:
     for l in lanes:
         rows.extend(l.get("lane_rows") or [])
     out["lane_rows"] = rows
+    facts = []
+    for l in lanes:
+        facts.extend(l.get("lane_facts") or [])
+    out["lane_facts"] = facts
+    # A median cannot be merged from medians. The fleet figure is therefore
+    # the slowest lane's, and the page says so rather than implying a
+    # median over all traffic.
+    out["p50_is_slowest_lane"] = len(lanes) > 1
     out["healthy"] = any(bool(l.get("healthy")) for l in lanes)
     out["live"] = any(bool(l.get("live")) for l in lanes)
     out["metrics_available"] = any(bool(l.get("metrics_available")) for l in lanes)
@@ -606,6 +614,17 @@ def snapshot(fwd, stats: dict) -> dict:
         # Streams that finished, so the panel says something between bursts.
         "recent_streams": recent_streams(getattr(fwd, "LISTEN_PORT", None)),
         "lane_rows": lane_rows,
+        # This lane's deployment facts as one row, so the panel can show
+        # every card at once instead of only the page you happen to open.
+        "lane_facts": [{
+            "lane": getattr(fwd, "LISTEN_PORT", None),
+            "name": getattr(fwd, "FWD_NAME", None),
+            "gpu": getattr(fwd, "FWD_GPU", None),
+            "upstream": port,
+            "upstream_kind": getattr(fwd, "_upstream_kind", None),
+            "keepalive_pid": keepalive_pid,
+            "facts": getattr(fwd, "_upstream_facts", {}) or {},
+        }],
     }
 
 
@@ -660,6 +679,15 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 /* Lanes panel: one row per card, this lane first. */
 .lanes{display:flex;flex-direction:column;gap:6px;margin-bottom:22px}
 .recent{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
+.facts.astable{display:block;padding:0}
+.ftab{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+.ftab th{text-align:left;color:var(--dim);font-weight:400;font-size:10px;
+  letter-spacing:.08em;text-transform:uppercase;padding:10px 12px;
+  border-bottom:1px solid var(--line)}
+.ftab td{padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;max-width:220px}
+.ftab tr:last-child td{border-bottom:0}
+.ftab .pill{padding:1px 6px;border-radius:8px;font-size:11px}
 .recent .rk{color:var(--dim);font-size:10px;letter-spacing:.08em;
   text-transform:uppercase;margin-bottom:6px}
 .lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1.5fr) minmax(0,2fr) auto minmax(80px,auto);
@@ -923,7 +951,7 @@ __HEADER__
     <div class="v" id="req">&mdash;</div><div class="n" id="conn_n">&nbsp;</div></div>
   <div class="card"><div class="k">Round trip</div>
     <div class="v"><span id="p50">&mdash;</span><span class="u" id="p50u">ms</span></div>
-    <div class="n">median, last 200</div></div>
+    <div class="n" id="p50_n">median, last 200</div></div>
   <div class="card"><div class="k">Server errors</div>
     <div class="v" id="e5">&mdash;</div><div class="n" id="e5_n">HTTP 5xx</div></div>
   <div class="card"><div class="k">Client errors</div>
@@ -1015,6 +1043,7 @@ $("rst-all").addEventListener("click",()=>{
 stampSince();
 
 async function tick(){
+  const esc=t=>String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   let s;
   try{ s=await (await fetch("/__stats.json",{cache:"no-store"})).json(); }
   catch(e){ if(++missed>2) document.body.classList.add("stale"); return; }
@@ -1092,6 +1121,10 @@ async function tick(){
   if(ms==null){ $("p50").textContent="—"; $("p50u").textContent="ms"; }
   else if(ms>=1000){ $("p50").textContent=(ms/1000).toFixed(1); $("p50u").textContent="s"; }
   else { $("p50").textContent=Math.round(ms); $("p50u").textContent="ms"; }
+  // A median cannot be merged from medians, so a fleet figure is the
+  // slowest lane's. Say that rather than imply a median over all traffic.
+  const p50n=document.getElementById("p50_n");
+  if(p50n) p50n.textContent = s.p50_is_slowest_lane ? "median, slowest lane" : "median, last 200";
 
   // --- model section: throughput, decode, prefill, draft ---
   const NP = "not provided by this upstream";
@@ -1285,6 +1318,39 @@ async function tick(){
   const setF=(id,v)=>{ const el=$(id);
     if(v && v!=="unknown" && v!=="none"){ el.textContent=v; el.classList.remove("dim"); }
     else { el.innerHTML=(v==="none")?"none":"&mdash;"; el.classList.add("dim"); } };
+  // Deployment for the whole fleet: one row per lane, so the panel matches
+  // the Lanes panel above it instead of describing only the page you opened.
+  // A single lane keeps the original label/value layout.
+  const LF=s.lane_facts||[];
+  const factsEl=$("facts");
+  if(LF.length>1){
+    const cell=v=>(v&&v!=="unknown")?esc(v):'<span class="dim">\u2014</span>';
+    factsEl.innerHTML='<table class="ftab"><thead><tr>'
+      +"<th>lane</th><th>engine</th><th>thinking</th><th>speculative</th>"
+      +"<th>parallel</th><th>upstream</th><th>keepalive</th><th>model path</th>"
+      +"</tr></thead><tbody>"
+      +LF.map(l=>{
+        const f=l.facts||{};
+        const th=(f.thinking==="on"||f.thinking==="off")
+          ? '<span class="pill '+f.thinking+'">'+f.thinking+"</span>" : cell(f.thinking);
+        const nm=esc(l.name||("lane :"+l.lane));
+        return "<tr>"
+          +`<td>${nm} <span class="dim">:${l.lane}</span></td>`
+          +`<td>${cell(f.engine)}</td><td>${th}</td>`
+          +`<td>${f.speculative==="none"?'<span class="dim">none</span>':cell(f.speculative)}</td>`
+          +`<td>${cell(f.parallel)}</td>`
+          +`<td class="dim">${l.upstream?((l.upstream_kind||"")+" :"+l.upstream):"\u2014"}</td>`
+          +`<td class="dim">${l.keepalive_pid||"\u2014"}</td>`
+          +`<td class="dim" title="${esc(f.model_path||"")}">${cell(f.model_path)}</td>`
+          +"</tr>";
+      }).join("")
+      +"</tbody></table>";
+    factsEl.classList.add("astable");
+  } else {
+    factsEl.classList.remove("astable");
+  }
+  if(LF.length>1) { /* the table replaced the rows; nothing more to fill */ }
+  else {
   setF("f_engine", F2.engine);
   // Thinking renders as a pill so on/off reads at a glance.
   const thEl=$("f_thinking");
@@ -1297,12 +1363,12 @@ async function tick(){
   }
   setF("f_spec", F2.speculative==="none"?"none":(F2.speculative||"unknown"));
   setF("f_par", F2.parallel);
+  }
   // Lanes: this lane first, then every --peer, one row per card with the
   // same buttons. A peer's button posts to THIS forwarder with lane=<port>;
   // the forwarder relays it with the peer's token, which never reaches the
   // page. Rows are rebuilt only when the set of lanes or presets changes,
   // so a click never lands on a freshly re-rendered button.
-  const esc=t=>String(t==null?"":t).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
   const lanesEl=$("lanes");
   const me={port:String(location.port||"80"),name:s.name,gpu:s.gpu,preset:s.preset,loading:s.loading,
     operator_stopped:s.operator_stopped,healthy:s.healthy,model:s.model,presets:s.presets||[],reachable:true,self:true};
@@ -1335,6 +1401,7 @@ async function tick(){
   });
   // The Model row that used to sit here moved into the Lanes panel above:
   // its first row is this lane, same state, same buttons. One place to press.
+  if(LF.length<=1){
   setF("f_model", F2.model_path);
   const kaEl=$("f_ka");
   if(s.keepalive_pid){ kaEl.textContent=s.keepalive_pid; kaEl.classList.remove("dim"); }
@@ -1349,6 +1416,7 @@ async function tick(){
       +"; configured preference: "+(s.prefer||"llama-server");
     upEl.classList.remove("dim");
   } else { upEl.innerHTML="&mdash;"; upEl.classList.add("dim"); }
+  }
 
   // --- control buttons: only visible when container mode is on ---
   const ctl=$("ctl");
