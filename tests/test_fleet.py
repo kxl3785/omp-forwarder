@@ -481,3 +481,39 @@ class RecentMergeTests(ForwarderCase):
                 "recent_streams": [{"slot": 0, "lane": 8891, "ended": 9.0, "tokens": 2}]}
         m = stats.merge_snapshots(own, [peer])
         self.assertEqual([x["lane"] for x in m["recent_streams"]], [8891, 8890])
+
+
+class LaneRowTests(ForwarderCase):
+    """SGLang has no /slots, so it contributes one row per lane."""
+
+    def test_sglang_metrics_make_a_lane_row(self):
+        fwd.LISTEN_PORT = 8891
+        fwd._upstream = 30001
+        fwd._upstream_healthy = True
+        m = {"sglang:num_running_reqs": 2.0, "sglang:num_queue_reqs": 1.0,
+             "sglang:gen_throughput": 161.7, "sglang:cache_hit_rate": 0.42,
+             "sglang:context_len": 262144.0, "sglang:token_usage": 0.3}
+        with mock.patch.object(stats, "upstream_metrics", return_value=m):
+            with mock.patch.object(stats, "upstream_slots", return_value=[]):
+                d = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertEqual(len(d["lane_rows"]), 1)
+        r = d["lane_rows"][0]
+        self.assertEqual((r["lane"], r["engine"], r["running"], r["rate"]),
+                         (8891, "sglang", 2.0, 161.7))
+
+    def test_a_llama_lane_makes_no_lane_row(self):
+        fwd._upstream = 49500
+        fwd._upstream_healthy = True
+        with mock.patch.object(stats, "upstream_metrics",
+                               return_value={"llamacpp:n_decode_total": 5}):
+            with mock.patch.object(stats, "upstream_slots", return_value=[]):
+                d = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertEqual(d["lane_rows"], [])
+
+    def test_merge_collects_rows_from_every_lane(self):
+        own = {"listen": 8890, "slots": [], "days": [], "healthy": True,
+               "lane_rows": []}
+        peer = {"listen": 8891, "slots": [], "days": [], "healthy": True,
+                "lane_rows": [{"lane": 8891, "engine": "sglang", "rate": 161.7}]}
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual([r["lane"] for r in m["lane_rows"]], [8891])

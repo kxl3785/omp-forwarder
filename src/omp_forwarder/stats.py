@@ -376,6 +376,10 @@ def merge_snapshots(own: dict, peers: list) -> dict:
         recent.extend(l.get("recent_streams") or [])
     recent.sort(key=lambda r: r.get("ended") or 0, reverse=True)
     out["recent_streams"] = recent[:12]
+    rows = []
+    for l in lanes:
+        rows.extend(l.get("lane_rows") or [])
+    out["lane_rows"] = rows
     out["healthy"] = any(bool(l.get("healthy")) for l in lanes)
     out["live"] = any(bool(l.get("live")) for l in lanes)
     out["metrics_available"] = any(bool(l.get("metrics_available")) for l in lanes)
@@ -441,6 +445,22 @@ def snapshot(fwd, stats: dict) -> dict:
     g = m.get
     slots = upstream_slots(port) if live else []
     # The keepalive child's pid when container mode is on, else None.
+    # SGLang has no /slots and never will: it reports counts, not slots.
+    # A lane running it therefore contributes ONE row to the per-stream
+    # table -- what the engine itself reports about all its work -- instead
+    # of disappearing from it. Never call these rows streams.
+    lane_rows = []
+    if any(k.startswith("sglang:") for k in m):
+        lane_rows.append({
+            "lane": getattr(fwd, "LISTEN_PORT", None),
+            "engine": "sglang",
+            "running": g("sglang:num_running_reqs", 0),
+            "queued": g("sglang:num_queue_reqs", 0),
+            "rate": g("sglang:gen_throughput", 0.0),
+            "cached": g("sglang:cache_hit_rate", 0.0),
+            "ctx": g("sglang:context_len", 0.0),
+            "kv": g("sglang:token_usage", 0.0),
+        })
     ensure_stream_watcher(fwd)
     _ka = getattr(fwd, "_container_keepalive", None)
     keepalive_pid = _ka.pid if _ka is not None else None
@@ -581,6 +601,7 @@ def snapshot(fwd, stats: dict) -> dict:
         "slots": slots,
         # Streams that finished, so the panel says something between bursts.
         "recent_streams": recent_streams(getattr(fwd, "LISTEN_PORT", None)),
+        "lane_rows": lane_rows,
     }
 
 
@@ -1073,8 +1094,12 @@ async function tick(){
   if(engine==="sglang" && s.metrics_available){
     // SGLang exposes different metric names; map onto the same cards.
     // Throughput is a live gauge (tok/s), not a counter to difference.
-    $("tput").textContent=fmt(s.gen_throughput);
-    $("tput_n").textContent="live, from SGLang";
+    // Mixed fleet seen from an SGLang lane: gen_throughput is already the
+    // sum of every SGLang lane, and renderSlots returns the llama half.
+    const mix=renderSlots(s);
+    const both=(s.gen_throughput||0)+(mix.haveRate?mix.total:0);
+    $("tput").textContent=fmt(both);
+    $("tput_n").textContent=mix.haveRate?"SGLang + per-stream, all lanes":"live, from SGLang";
     // Decode and Prefill are not separately exposed by SGLang.
     $("dec").textContent="—"; $("dec_n").textContent=NP;
     $("pre").textContent="—"; $("pre_n").textContent=NP;
@@ -1104,7 +1129,7 @@ async function tick(){
 
     // Throughput: prefer per-stream decode rates from /slots; fall back to
     // the completion counter when /slots is unavailable.
-    if((s.slots||[]).length){
+    if((s.slots||[]).length || (s.lane_rows||[]).length){
       if(live.decoding>0 && live.haveRate){
         $("tput").textContent=fmt(live.total);
         $("tput_n").textContent = live.decoding+(live.decoding>1?" streams":" stream")+" decoding"
@@ -1405,6 +1430,23 @@ function renderSlots(s){
   const live=new Set(slots.map(x=>x.id));
   for(const k of Array.from(slotHist.keys())) if(!live.has(k)) slotHist.delete(k);
 
+  // A lane with no /slots (SGLang) reports counts, not slots. Its row says
+  // what the engine says about all its work at once, and its throughput
+  // joins the fleet total: both halves are tok/s, and a page that shows
+  // only the llama half of a mixed fleet is not a fleet view.
+  for(const lr of (s.lane_rows||[])){
+    if(lr.rate>0){ total+=lr.rate; haveRate=true; }
+    if(lr.running>0) decoding+=lr.running;
+    rows.push("<tr>"
+      +`<td><span class="dim">:${lr.lane} \u00b7 </span>${lr.engine} <span class="dim">whole lane</span></td>`
+      +`<td class="dim">${lr.running>0?"running":"idle"}${lr.queued>0?(" \u00b7 "+lr.queued+" queued"):""}</td>`
+      +`<td class="rate">${lr.rate>0?fmt(lr.rate):'<span class="dim">\u2014</span>'}</td>`
+      +`<td>${Math.round(lr.running)} <span class="dim">reqs</span></td>`
+      +`<td>${Math.round(lr.ctx).toLocaleString()}</td>`
+      +`<td>${Math.round(100*(lr.cached||0))}%</td>`
+      +`<td class="dim">KV ${Math.round(100*(lr.kv||0))}%</td>`
+      +"</tr>");
+  }
   const box=document.getElementById("slots");
   const note=document.getElementById("slots_n");
   const out={decoding,prefilling,total,haveRate};
@@ -1413,7 +1455,9 @@ function renderSlots(s){
     note.textContent = (s.slots||[]).length ? ((s.slots||[]).length+" slots idle") : "";
     return out;
   }
-  note.textContent = rows.length+" of "+(s.slots||[]).length+" slots busy";
+  const nlr=(s.lane_rows||[]).length;
+  note.textContent = (rows.length-nlr)+" of "+(s.slots||[]).length+" slots busy"
+    + (nlr ? (" \u00b7 "+nlr+" lane"+(nlr>1?"s":"")+" without /slots") : "");
   box.innerHTML="<table><thead><tr>"
     +"<th>stream</th><th>phase</th><th>tok/s</th><th>generated</th>"
     +"<th>context</th><th>cached</th><th>budget left</th></tr></thead><tbody>"
