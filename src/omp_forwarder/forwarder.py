@@ -43,6 +43,14 @@ import secrets
 import shlex
 import socket
 import subprocess
+
+#: Under pythonw (the tray launcher) there is no console, so every console
+#: program this module spawns -- wsl.exe, tasklist, netstat, nvidia-smi,
+#: taskkill, the preset launchers -- would open a visible console window of
+#: its own, and the sampler spawns one every 10 s. Kevin saw a Windows
+#: Terminal flash on that cadence. Zero on non-Windows, where the flag does
+#: not exist.
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 import sys
 import threading
 import time
@@ -302,7 +310,7 @@ def _run_wsl(args: list[str], timeout: float = 10.0):
     """All container-mode subprocess calls go through this one function so
     tests can replace it with a fake that returns recorded output."""
     try:
-        return subprocess.run(args, capture_output=True, text=True,
+        return subprocess.run(args, creationflags=_NO_WINDOW, capture_output=True, text=True,
                               timeout=timeout)
     except Exception:
         return None
@@ -314,7 +322,7 @@ def _run_host(args: list[str], timeout: float = 10.0):
     recorded output, exactly as they replace _run_wsl. The timeout matters:
     the monitor thread must never stall on a hung query."""
     try:
-        return subprocess.run(args, capture_output=True, text=True,
+        return subprocess.run(args, creationflags=_NO_WINDOW, capture_output=True, text=True,
                               timeout=timeout)
     except Exception:
         return None
@@ -323,7 +331,7 @@ def _run_host(args: list[str], timeout: float = 10.0):
 def _spawn_wsl(args: list[str]) -> subprocess.Popen:
     """Long-lived child (the keepalive). Separate from _run_wsl because
     Popen must not be waited on; tests replace this too."""
-    return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+    return subprocess.Popen(args, creationflags=_NO_WINDOW, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
 
@@ -331,7 +339,7 @@ def _spawn_host(args: list[str]) -> subprocess.Popen:
     """Long-lived host child: the model server launched by --upstream-cmd.
     Its own seam, so tests can assert what would be started without
     starting anything."""
-    return subprocess.Popen(args, stdout=subprocess.DEVNULL,
+    return subprocess.Popen(args, creationflags=_NO_WINDOW, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
 
 
@@ -691,7 +699,7 @@ def _server_pids() -> set[str]:
     try:
         out = subprocess.run(
             ["tasklist", "/FI", "IMAGENAME eq llama-server.exe",
-             "/FO", "CSV", "/NH"],
+             "/FO", "CSV", "/NH"], creationflags=_NO_WINDOW,
             capture_output=True, text=True, timeout=20).stdout
     except Exception as exc:
         log(f"tasklist failed: {exc!r}")
@@ -714,7 +722,7 @@ def _listening_ports(pids: set[str]) -> list[int]:
     if not pids:
         return []
     try:
-        out = subprocess.run(["netstat", "-ano", "-p", "TCP"],
+        out = subprocess.run(["netstat", "-ano", "-p", "TCP"], creationflags=_NO_WINDOW,
                              capture_output=True, text=True,
                              timeout=30).stdout
     except Exception as exc:
