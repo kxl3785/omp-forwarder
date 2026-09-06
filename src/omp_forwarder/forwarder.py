@@ -526,7 +526,7 @@ def _sample_peers() -> None:
         # its own sampler has run once (see stats.snapshot on dead ports),
         # and a 2 s read missed it, so the Lanes panel said "unreachable"
         # and the relay answered "peer not read yet" for the first minute.
-        d = stats_mod._http_get_json(port, "/__stats.json", timeout=5)
+        d = stats_mod._http_get_json(port, "/__stats.json?self=1", timeout=5)
         if isinstance(d, dict):
             facts = d.get("facts") or {}
             _peer_state[port] = {
@@ -1364,6 +1364,23 @@ def _peer_control(port: int, token: str, action: str, preset: str,
         conn.close()
 
 
+def _peer_snapshots() -> list:
+    """Each reachable peer's own snapshot, read now, for the fleet view.
+    Only peers the sampler last saw alive are asked: a dead port costs a
+    2 s connect timeout on this Windows, and this runs on the page's poll.
+    The peer's token is dropped here; a page never holds another lane's."""
+    from . import stats as stats_mod
+    out = []
+    for port, st in list(_peer_state.items()):
+        if not st.get("reachable"):
+            continue
+        d = stats_mod._http_get_json(port, "/__stats.json?self=1", timeout=2)
+        if isinstance(d, dict):
+            d.pop("control_token", None)
+            out.append(d)
+    return out
+
+
 def _serve_control(client: socket.socket, path: str, method: str) -> None:
     """POST /__control?token=<T>&action=<start|stop|restart>.
     Routes on the first line's method and query string only; the body is
@@ -1507,7 +1524,13 @@ def _serve_local(client: socket.socket, path: str, method: str = "GET") -> None:
         # dead port here costs a 2 s connect timeout on this Windows.
         if not _stats.get("model") and not _health_sampled:
             _stats["model"] = stats_mod.upstream_model(_upstream)
-        body = json.dumps(stats_mod.snapshot(me, _stats)).encode()
+        snap = stats_mod.snapshot(me, _stats)
+        # The default answer is the fleet: every reachable peer folded in.
+        # ?self=1 is this lane alone -- what peers ask for, so two lanes
+        # never fold each other in forever.
+        if "self=1" not in path:
+            snap = stats_mod.merge_snapshots(snap, _peer_snapshots())
+        body = json.dumps(snap).encode()
         ctype = "application/json"
     elif path.startswith("/__usage"):
         from . import usage as usage_mod

@@ -208,6 +208,79 @@ def upstream_facts(port: int | None) -> dict:
         facts["model_path"] = ""
     return facts
 
+#: Cumulative counters and gauges that add across lanes. Summed BEFORE the
+#: page differences them, so the page's existing rate logic yields fleet
+#: rates without knowing there is more than one lane.
+_SUM_KEYS = (
+    "conns", "requests", "status_2xx", "status_4xx", "status_5xx",
+    "fallbacks", "unavailable", "tok_prompt", "tok_cached", "tok_gen",
+    "tok_today_prompt", "tok_today_cached", "tok_today_gen",
+    "gen_tokens", "gen_seconds", "prompt_tokens", "prompt_seconds",
+    "prompt_cached", "decode_steps", "draft_total", "draft_accepted",
+    "drafts", "processing", "deferred", "gen_throughput", "sglang_running",
+    "sglang_queued", "sglang_prompt_tokens", "sglang_gen_tokens",
+    "sglang_requests_total",
+)
+#: High-water marks and ratios: the largest lane speaks for the fleet.
+_MAX_KEYS = ("ctx", "tokens_max", "sglang_context_len", "sglang_token_usage",
+             "sglang_cache_hit_rate", "sglang_spec_accept_length",
+             "latency_p50_ms")
+
+
+def merge_snapshots(own: dict, peers: list) -> dict:
+    """One snapshot for every lane: this lane's, with each reachable peer's
+    folded in. Counters add, high-water marks take the max, per-stream rows
+    concatenate with a lane tag and a lane-unique id, the model names join,
+    healthy means any lane is. Everything about THIS lane -- its port,
+    token, presets, assignment, peers, GPUs -- stays its own.
+
+    The page differences cumulative counters between polls, so summing them
+    first makes its throughput, prefill and request rates fleet totals with
+    no change to that logic. One lane reloading (counters restart at zero)
+    costs one odd tick, as it always did."""
+    lanes = [own] + [p for p in peers if isinstance(p, dict)]
+    out = dict(own)
+    out["fleet"] = {"lanes": len(lanes),
+                    "serving": sum(1 for l in lanes if l.get("healthy")),
+                    "ports": [l.get("listen") for l in lanes]}
+    if len(lanes) == 1:
+        return out
+    for k in _SUM_KEYS:
+        out[k] = sum((l.get(k) or 0) for l in lanes)
+    for k in _MAX_KEYS:
+        vals = [l.get(k) for l in lanes if isinstance(l.get(k), (int, float))]
+        out[k] = max(vals) if vals else own.get(k)
+    slots = []
+    for l in lanes:
+        port = l.get("listen")
+        for sl in l.get("slots") or []:
+            row = dict(sl)
+            row["lane"] = port
+            row["slot"] = sl.get("id")
+            # Unique across lanes: the page keys its rate history by id.
+            row["id"] = f"{port}:{sl.get('id')}"
+            slots.append(row)
+    out["slots"] = slots
+    out["healthy"] = any(bool(l.get("healthy")) for l in lanes)
+    out["live"] = any(bool(l.get("live")) for l in lanes)
+    out["metrics_available"] = any(bool(l.get("metrics_available")) for l in lanes)
+    names = []
+    for l in lanes:
+        m = l.get("model")
+        if m and m != "-" and m not in names:
+            names.append(m)
+    out["model"] = " + ".join(names) if names else "-"
+    days: dict = {}
+    for l in lanes:
+        for d in l.get("days") or []:
+            row = days.setdefault(d.get("day"), {"day": d.get("day"),
+                                                 "prompt": 0, "cached": 0, "gen": 0})
+            for k in ("prompt", "cached", "gen"):
+                row[k] += d.get(k) or 0
+    out["days"] = [days[k] for k in sorted(days)]
+    return out
+
+
 def snapshot(fwd, stats: dict) -> dict:
     """One JSON sample. Cumulative counters are returned raw -- the page
     differences successive samples for live rates, and differences a stored
@@ -792,11 +865,14 @@ async function tick(){
     : "not provided by this upstream";
 
   // --- bar ---
-  $("listen").textContent="127.0.0.1:"+s.listen;
+  const nl=(s.fleet&&s.fleet.lanes)||1;
+  // One page for every lane: the header names the fleet, the Lanes panel
+  // below names each card. A lone lane reads as before.
+  $("listen").textContent=nl>1?("fleet \u00b7 "+nl+" lanes"):("127.0.0.1:"+s.listen);
   _ctrlToken=s.control_token||"";
   // No upstream means 503 with Retry-After, not a silent hop to Studio,
   // unless --studio-fallback was given: say which.
-  $("up").textContent=s.upstream?("127.0.0.1:"+s.upstream):(s.studio_fallback?"Studio :8888 (fallback)":"none");
+  $("up").textContent=nl>1?(s.fleet.serving+" of "+nl+" serving"):(s.upstream?("127.0.0.1:"+s.upstream):(s.studio_fallback?"Studio :8888 (fallback)":"none"));
   $("up").title = s.upstream_exe || "";
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.healthy?"on":"off");
@@ -1147,7 +1223,7 @@ function renderSlots(s){
     slotHist.set(sl.id,{task:sl.task,decoded:sl.decoded,prompt:sl.prompt,t:s.t});
     const hit = sl.prompt>0 ? (100*sl.cached/sl.prompt) : null;
     rows.push("<tr>"
-      +`<td>slot ${sl.id}${sl.spec?"":' <span class="dim">no spec</span>'}</td>`
+      +`<td>${sl.lane!=null?('<span class="dim">:'+sl.lane+' \u00b7 </span>'):""}slot ${sl.slot!=null?sl.slot:sl.id}${sl.spec?"":' <span class="dim">no spec</span>'}</td>`
       +`<td class="dim">${phase}${(phase==="prefill"&&rate==null)?" · queued":""}</td>`
       +`<td class="rate">${rate==null?'<span class="dim">…</span>':fmt(rate)}</td>`
       +`<td>${Math.round(sl.decoded).toLocaleString()}</td>`

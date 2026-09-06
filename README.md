@@ -506,3 +506,7 @@ The dashboard's Lanes panel shows, on this lane's row, one button per preset and
 ## One page for every card
 
 Each lane's dashboard has a Lanes panel: this lane first, then every `--peer`, one row per card with GPU, preset state, health, model, and the same preset and `unload` buttons. A button on a peer's row posts to *this* forwarder with `lane=<peer port>`; the forwarder relays it to the peer with the peer's own token, which it read from the peer's `/__stats.json` server-side. The page never holds another lane's token, there are still no CORS headers, and a `lane` that is not in `--peer` is refused, so the relay is not a proxy. Point two lanes at each other with `--peer` and either page manages both GPUs.
+
+## One dashboard for every card
+
+`/__stats.json` answers for the fleet: this lane's numbers with every reachable `--peer` folded in. Counters add, so throughput, prefill, requests and tokens on the page are totals across cards; the per-stream table lists every stream with its lane; the model field joins the names; the header reads `fleet · 2 lanes` and `2 of 2 serving`. The Lanes panel is where each card's own state and buttons live. `/__stats.json?self=1` is one lane alone, which is what lanes ask each other for. The Usage page sums the same way. Open either lane's page; they show the same thing.

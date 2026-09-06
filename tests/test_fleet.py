@@ -260,3 +260,93 @@ class LaneOwnershipTests(ForwarderCase):
         a, b, c = self._scan([49501])
         with a, b, c:
             self.assertEqual(fwd._choose_upstream(), (49501, "llama-server"))
+
+
+class MergeSnapshotTests(ForwarderCase):
+    """One snapshot for every lane."""
+
+    def _lane(self, port, **kw):
+        d = {"listen": port, "requests": 0, "tok_gen": 0, "gen_tokens": 0,
+             "ctx": 0, "healthy": False, "model": "-", "slots": [], "days": []}
+        d.update(kw)
+        return d
+
+    def test_counters_add_and_marks_take_max(self):
+        own = self._lane(8890, requests=3, tok_gen=100, ctx=4096, healthy=False)
+        peer = self._lane(8891, requests=5, tok_gen=50, ctx=262144, healthy=True)
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual((m["requests"], m["tok_gen"], m["ctx"]), (8, 150, 262144))
+        self.assertTrue(m["healthy"])
+        self.assertEqual(m["fleet"], {"lanes": 2, "serving": 1, "ports": [8890, 8891]})
+
+    def test_slots_concatenate_with_lane_tags_and_unique_ids(self):
+        own = self._lane(8890, slots=[{"id": 0, "busy": True, "decoded": 5}])
+        peer = self._lane(8891, slots=[{"id": 0, "busy": True, "decoded": 9}])
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual([(r["id"], r["lane"], r["slot"]) for r in m["slots"]],
+                         [("8890:0", 8890, 0), ("8891:0", 8891, 0)])
+
+    def test_models_join_and_days_sum_by_day(self):
+        own = self._lane(8890, model="tune", days=[{"day": "2026-09-05", "prompt": 1, "cached": 2, "gen": 3}])
+        peer = self._lane(8891, model="candidate", days=[{"day": "2026-09-05", "prompt": 10, "cached": 20, "gen": 30},
+                                                         {"day": "2026-09-04", "prompt": 1, "cached": 1, "gen": 1}])
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual(m["model"], "tune + candidate")
+        self.assertEqual(m["days"], [{"day": "2026-09-04", "prompt": 1, "cached": 1, "gen": 1},
+                                     {"day": "2026-09-05", "prompt": 11, "cached": 22, "gen": 33}])
+
+    def test_own_lane_fields_stay_own(self):
+        own = self._lane(8890, control_token="mine", preset="llama-tune", gpu=0)
+        peer = self._lane(8891, control_token="theirs", preset="sglang-nothink", gpu=1)
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual((m["control_token"], m["preset"], m["gpu"], m["listen"]),
+                         ("mine", "llama-tune", 0, 8890))
+
+    def test_single_lane_is_unchanged_but_named(self):
+        own = self._lane(8890, requests=3, slots=[{"id": 0}])
+        m = stats.merge_snapshots(own, [])
+        self.assertEqual(m["requests"], 3)
+        self.assertEqual(m["slots"], [{"id": 0}])
+        self.assertEqual(m["fleet"]["lanes"], 1)
+
+
+class FleetJsonTests(RelayCase):
+    """/__stats.json is the fleet; ?self=1 is this lane alone."""
+
+    PEER = {"listen": 8891, "requests": 5, "healthy": True, "model": "candidate",
+            "slots": [{"id": 0, "busy": True, "decoded": 1}], "days": [],
+            "control_token": "peer-secret"}
+
+    def setUp(self):
+        super().setUp()
+        fwd._stats["requests"] = 2
+        fwd._peer_state = {8891: {"port": 8891, "reachable": True}}
+
+    def _get(self, path):
+        out = raw_request(self.port, [f"GET {path} HTTP/1.1\r\n\r\n".encode()])
+        return _body(out)
+
+    def test_default_view_folds_reachable_peers_in(self):
+        asked = []
+        with mock.patch.object(stats, "_http_get_json",
+                               side_effect=lambda port, path, timeout=4: asked.append((port, path)) or dict(self.PEER)):
+            d = self._get("/__stats.json")
+        self.assertEqual(asked, [(8891, "/__stats.json?self=1")])
+        self.assertEqual(d["requests"], 7)
+        self.assertEqual(d["fleet"]["lanes"], 2)
+        self.assertEqual(d["slots"][0]["lane"], 8891)
+        self.assertNotIn("peer-secret", json.dumps(d))
+
+    def test_self_view_asks_no_peer(self):
+        with mock.patch.object(stats, "_http_get_json") as g:
+            d = self._get("/__stats.json?self=1")
+        g.assert_not_called()
+        self.assertEqual(d["requests"], 2)
+        self.assertNotIn("fleet", d)   # a lane alone is not a fleet
+
+    def test_unreachable_peer_is_not_asked(self):
+        fwd._peer_state = {8891: {"port": 8891, "reachable": False}}
+        with mock.patch.object(stats, "_http_get_json") as g:
+            d = self._get("/__stats.json")
+        g.assert_not_called()
+        self.assertEqual(d["requests"], 2)
