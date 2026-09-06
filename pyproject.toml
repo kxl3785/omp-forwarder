@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "omp-forwarder"
-version = "0.4.0"
+version = "0.5.0"
 description = "A fixed local port in front of Unsloth Studio's llama-server, with a live dashboard."
 readme = "README.md"
 requires-python = ">=3.10"
