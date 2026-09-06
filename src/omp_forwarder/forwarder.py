@@ -455,6 +455,27 @@ def _container_monitor() -> None:
         _reevaluate_upstream()
 
 
+def _sample_model() -> None:
+    """Fill the header's model name from /v1/models, off the request path.
+
+    The name used to be read on the first /__stats.json poll that found it
+    empty. A page opened during a load got "-" from a server that was not
+    ready, and "-" counted as known, so a serving lane showed no name until
+    the forwarder restarted: nothing said whether the right model had
+    loaded. Now the sampler retries every tick while the upstream is
+    healthy and the name is still unknown, and clears a stale dash when the
+    upstream goes away."""
+    from . import stats as stats_mod
+    if not _upstream_healthy:
+        if _stats.get("model") == "-":
+            _stats["model"] = ""
+        return
+    if _stats.get("model") in ("", "-", None):
+        name = stats_mod.upstream_model(_upstream)
+        if name and name != "-":
+            _stats["model"] = name
+
+
 def _sample_health() -> None:
     """Remember whether the current upstream answers /health with 200.
     Runs on the sampler thread; never on the request path.
@@ -523,6 +544,8 @@ def _sample_peers() -> None:
                 "operator_stopped": bool(d.get("operator_stopped")),
                 "presets": list(d.get("presets") or []),
                 "model": d.get("model") or "",
+                # The port the peer fronts, so this lane never takes it.
+                "upstream": d.get("upstream"),
             }
             if d.get("control_token"):
                 _peer_tokens[port] = d["control_token"]
@@ -597,6 +620,7 @@ def _upstream_sampler() -> None:
     while True:
         time.sleep(10)
         _sample_health()
+        _sample_model()
         _sample_upstream_facts()
         _sample_peers()
         _sample_gpus()
@@ -793,6 +817,7 @@ def _choose_upstream() -> tuple[int, str] | None:
     ask "what would discovery pick now?" without committing the result."""
     servers = _listening_ports(_server_pids())
     candidates = _candidate_ports()
+    taken = _taken_ports()
 
     order = (("llama-server", servers), ("candidate", candidates)) \
         if PREFER == "llama-server" else \
@@ -800,9 +825,38 @@ def _choose_upstream() -> tuple[int, str] | None:
 
     for kind, ports in order:
         for port in ports:
+            if port in taken:
+                continue
             if _healthy(port):
                 return (port, kind)
     return None
+
+
+def _taken_ports() -> set[int]:
+    '''Ports this lane must never discover: what a peer lane fronts now,
+    and every preset port that belongs to another GPU.
+
+    Found live 2026-09-05: the GPU 0 lane, with nothing assigned, discovered
+    the llama-server the GPU 1 lane had just loaded (same executable, the
+    highest healthy port wins) and showed it as ready -- its traffic would
+    have gone to the other card, and its header's stop would have killed
+    the other card's model. A lane owns one GPU; the ports that belong to
+    the other cards are known from the presets, and the ports the other
+    lanes front are in their snapshots.'''
+    taken: set[int] = set()
+    for peer in _peer_state.values():
+        up = peer.get("upstream")
+        if up:
+            taken.add(int(up))
+    if FWD_GPU is not None:
+        for p in _presets.values():
+            for g in range(8):
+                if g != int(FWD_GPU):
+                    try:
+                        taken.add(_preset_port(p, g))
+                    except (TypeError, ValueError):
+                        pass
+    return taken
 
 
 def _reevaluate_upstream() -> None:
@@ -1381,8 +1435,16 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
                   {"ok": False, "lane": lane_port,
                    "error": "peer not read yet; try again in 10 s"})
             return
-        code, body = _peer_control(lane_port, peer_token, action,
-                                   (params.get("preset") or [""])[0])
+        preset_arg = (params.get("preset") or [""])[0]
+        code, body = _peer_control(lane_port, peer_token, action, preset_arg)
+        if code == 403:
+            # The peer restarted since the sampler last read it, so its
+            # token changed. Re-read once and retry, instead of handing the
+            # operator "bad token" for a button they were entitled to press.
+            _sample_peers()
+            fresh = _peer_tokens.get(lane_port)
+            if fresh and fresh != peer_token:
+                code, body = _peer_control(lane_port, fresh, action, preset_arg)
         body = dict(body) if isinstance(body, dict) else {"ok": False}
         body["lane"] = lane_port
         reply(_RELAY_STATUS.get(code, "502 Bad Gateway"), body)
@@ -1440,7 +1502,10 @@ def _serve_local(client: socket.socket, path: str, method: str = "GET") -> None:
             pass
         return
     if path.startswith(("/__stats.json", "/__usage.json")):
-        if not _stats.get("model"):
+        # First poll only, and only before the sampler has a verdict: after
+        # that the sampler owns the name (see _sample_model), and asking a
+        # dead port here costs a 2 s connect timeout on this Windows.
+        if not _stats.get("model") and not _health_sampled:
             _stats["model"] = stats_mod.upstream_model(_upstream)
         body = json.dumps(stats_mod.snapshot(me, _stats)).encode()
         ctype = "application/json"

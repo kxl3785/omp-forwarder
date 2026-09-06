@@ -68,6 +68,39 @@ class LaneRelayTests(RelayCase):
         b = _body(out)
         self.assertEqual((b["status"], b["lane"]), ("loading", 8891))
 
+    def test_stale_peer_token_is_refreshed_and_retried_once(self):
+        # 8891 restarted between two sampler ticks: its token changed, the
+        # first relay got 403, and the operator saw "bad token".
+        calls = []
+
+        def relay(port, token, action, preset, timeout=90.0):
+            calls.append(token)
+            if token == "peer-secret":
+                return 403, {"ok": False, "error": "bad token"}
+            return 200, {"ok": True, "status": "stopped"}
+
+        def resample():
+            fwd._peer_tokens[8891] = "new-secret"
+
+        with mock.patch.object(fwd, "_peer_control", side_effect=relay):
+            with mock.patch.object(fwd, "_sample_peers", side_effect=resample):
+                out = self._post("token=tok&lane=8891&action=stop")
+        self.assertTrue(out.startswith(b"HTTP/1.1 200"), out[:80])
+        self.assertEqual(calls, ["peer-secret", "new-secret"])
+
+    def test_peer_403_with_unchanged_token_is_not_retried(self):
+        calls = []
+
+        def relay(port, token, action, preset, timeout=90.0):
+            calls.append(token)
+            return 403, {"ok": False, "error": "bad token"}
+
+        with mock.patch.object(fwd, "_peer_control", side_effect=relay):
+            with mock.patch.object(fwd, "_sample_peers"):
+                out = self._post("token=tok&lane=8891&action=stop")
+        self.assertTrue(out.startswith(b"HTTP/1.1 403"), out[:80])
+        self.assertEqual(calls, ["peer-secret"])
+
     def test_peer_status_passes_through(self):
         with mock.patch.object(fwd, "_peer_control",
                                return_value=(409, {"ok": False, "error": "no-gpu"})):
@@ -136,6 +169,37 @@ class PeerControlHttpTests(ForwarderCase):
         self.assertFalse(body["ok"])
 
 
+class ModelNameSamplerTests(ForwarderCase):
+    """The header's model name is the operator's proof that the right model
+    loaded. A dash from a not-yet-ready server must not stick."""
+
+    def test_dash_is_retried_once_healthy(self):
+        fwd._upstream = 49500
+        fwd._stats["model"] = "-"          # what an early poll stored
+        fwd._upstream_healthy = True
+        with mock.patch.object(stats, "upstream_model", return_value="Qwen3.8-27B"):
+            fwd._sample_model()
+        self.assertEqual(fwd._stats["model"], "Qwen3.8-27B")
+
+    def test_unhealthy_upstream_is_not_asked_and_dash_is_cleared(self):
+        fwd._upstream = 49500
+        fwd._stats["model"] = "-"
+        fwd._upstream_healthy = False
+        with mock.patch.object(stats, "upstream_model") as um:
+            fwd._sample_model()
+        um.assert_not_called()
+        self.assertEqual(fwd._stats["model"], "")
+
+    def test_known_name_is_kept(self):
+        fwd._upstream = 49500
+        fwd._stats["model"] = "known"
+        fwd._upstream_healthy = True
+        with mock.patch.object(stats, "upstream_model") as um:
+            fwd._sample_model()
+        um.assert_not_called()
+        self.assertEqual(fwd._stats["model"], "known")
+
+
 class DeadUpstreamSnapshotTests(ForwarderCase):
     """An unloaded lane must answer /__stats.json at once. A connect to a
     closed loopback port can take the full timeout on Windows, and the
@@ -159,3 +223,40 @@ class DeadUpstreamSnapshotTests(ForwarderCase):
                 with mock.patch.object(stats, "upstream_slots", return_value=[]):
                     stats.snapshot(fwd, dict(fwd._stats))
             m.assert_called_once()
+
+
+class LaneOwnershipTests(ForwarderCase):
+    """A lane never discovers a server that another lane fronts, nor a port
+    that a preset maps to another GPU."""
+
+    def _scan(self, healthy_ports):
+        return (mock.patch.object(fwd, "_server_pids", return_value={"1": "x"}),
+                mock.patch.object(fwd, "_listening_ports", return_value=list(healthy_ports)),
+                mock.patch.object(fwd, "_healthy", side_effect=lambda p: p in healthy_ports))
+
+    def test_peer_upstream_is_skipped(self):
+        fwd._peer_state = {8891: {"port": 8891, "upstream": 49501, "reachable": True}}
+        a, b, c = self._scan([49501, 49500])
+        with a, b, c:
+            self.assertEqual(fwd._choose_upstream(), (49500, "llama-server"))
+
+    def test_other_gpu_preset_port_is_skipped_even_with_no_peer(self):
+        fwd.FWD_GPU = 0
+        fwd._presets = {"llama-tune": {"kind": "process", "port": "4950{gpu}", "cmd": "x"}}
+        a, b, c = self._scan([49501])
+        with a, b, c:
+            self.assertIsNone(fwd._choose_upstream())
+
+    def test_own_gpu_preset_port_is_taken(self):
+        fwd.FWD_GPU = 1
+        fwd._presets = {"llama-tune": {"kind": "process", "port": "4950{gpu}", "cmd": "x"}}
+        a, b, c = self._scan([49501])
+        with a, b, c:
+            self.assertEqual(fwd._choose_upstream(), (49501, "llama-server"))
+
+    def test_no_gpu_flag_means_no_preset_exclusion(self):
+        fwd.FWD_GPU = None
+        fwd._presets = {"llama-tune": {"kind": "process", "port": "4950{gpu}", "cmd": "x"}}
+        a, b, c = self._scan([49501])
+        with a, b, c:
+            self.assertEqual(fwd._choose_upstream(), (49501, "llama-server"))

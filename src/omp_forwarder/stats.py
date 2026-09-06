@@ -620,7 +620,6 @@ __HEADER__
   <div class="row"><span class="fk">Parallel</span><span class="fv dim" id="f_par">&mdash;</span></div>
   <div class="row"><span class="fk">Model path</span><span class="fv dim" id="f_model" title="">&mdash;</span></div>
   <div class="row"><span class="fk">Keepalive PID</span><span class="fv dim" id="f_ka">&mdash;</span></div>
-  <div class="row full" id="modelrow" hidden><span class="fk">Model</span><span class="fv" id="f_preset">&mdash;</span><span class="ctl" id="presetctl"></span><span class="ctl_msg"></span></div>
   <div class="row full"><span class="fk">Upstream</span><span class="fv dim" id="f_up" title="How the current upstream was found; the configured preference">&mdash;</span></div>
 </div>
 
@@ -1078,27 +1077,8 @@ async function tick(){
       if(b.dataset.act==="assign") b.classList.toggle("on", b.dataset.preset===l.preset && !l.operator_stopped && !!l.healthy);
     });
   });
-  // Model presets: one button per recipe the operator may put on this GPU,
-  // plus unload. Buttons are built once from the preset list and only
-  // their disabled state changes afterwards, so a click never lands on a
-  // freshly re-rendered element.
-  const mr=$("modelrow"), pc=$("presetctl");
-  const presets=s.presets||[];
-  mr.hidden=!presets.length;
-  if(presets.length){
-    if(pc.dataset.built!==presets.join("|")){
-      pc.innerHTML=presets.map(p=>'<button data-act="assign" data-preset="'+p+'">'+p+'</button>').join("")
-        +'<button data-act="stop" class="danger">unload</button>';
-      pc.dataset.built=presets.join("|");
-      wireCtl(pc);
-    }
-    const cur=s.preset?(s.preset+(s.loading?" · loading…":(s.operator_stopped?" · unloaded":" · serving"))):"none assigned";
-    $("f_preset").textContent=cur;
-    pc.querySelectorAll("button").forEach(b=>{
-      b.disabled=!!s.loading;
-      if(b.dataset.act==="assign") b.classList.toggle("on", b.dataset.preset===s.preset && !s.operator_stopped);
-    });
-  }
+  // The Model row that used to sit here moved into the Lanes panel above:
+  // its first row is this lane, same state, same buttons. One place to press.
   setF("f_model", F2.model_path);
   const kaEl=$("f_ka");
   if(s.keepalive_pid){ kaEl.textContent=s.keepalive_pid; kaEl.classList.remove("dim"); }
