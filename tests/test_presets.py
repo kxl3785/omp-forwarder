@@ -105,7 +105,8 @@ class AssignTests(ForwarderCase):
         with mock.patch.object(fwd, "_run_host",
                                side_effect=lambda a, timeout=10.0: killed.append(a) or _completed()), \
                 mock.patch.object(fwd, "_spawn_host",
-                                  side_effect=lambda a: spawned.append(a) or mock.Mock()):
+                                  side_effect=lambda a: spawned.append(a) or mock.Mock()), \
+                mock.patch.object(fwd, "_git_bash", return_value=None):
             status, port = fwd._assign_preset("llama-tune")
         self.assertEqual((status, port), ("loading", 49501))
         self.assertEqual(len(killed), 1)
@@ -208,3 +209,65 @@ class SnapshotPresetTests(ForwarderCase):
         self.assertTrue(s["loading"])
         fwd._upstream_healthy = True
         self.assertFalse(stats.snapshot(fwd, dict(fwd._stats))["loading"])
+
+
+class HostArgvTests(ForwarderCase):
+    """The launch command becomes argv the way a shell would read it, and a
+    bare `bash` means Git's bash. Live 2026-09-05: `bash launch.sh` under a
+    plain Windows PATH ran WSL's System32 bash, which cannot open a Windows
+    path, so assign answered "loading" twice and no server ever started;
+    the quoted Git path then kept its quotes through shlex(posix=False) and
+    CreateProcess could not find it either."""
+
+    def test_quoted_path_with_spaces_is_one_token(self):
+        with mock.patch.object(fwd, "_git_bash", return_value=None):
+            argv = fwd._host_argv('"C:/Program Files/Git/usr/bin/bash.exe" C:/x/launch.sh 0 49500')
+        self.assertEqual(argv, ["C:/Program Files/Git/usr/bin/bash.exe",
+                                "C:/x/launch.sh", "0", "49500"])
+
+    def test_backslash_paths_survive(self):
+        with mock.patch.object(fwd, "_git_bash", return_value=None), \
+                mock.patch.object(fwd.os, "name", "nt"):
+            argv = fwd._host_argv(r'"C:\Program Files\Git\usr\bin\bash.exe" C:\x\launch.sh 0 49500')
+        self.assertEqual(argv[0], "C:/Program Files/Git/usr/bin/bash.exe")
+        self.assertEqual(argv[1:], ["C:/x/launch.sh", "0", "49500"])
+
+    def test_bare_bash_means_git_bash_when_present(self):
+        with mock.patch.object(fwd, "_git_bash", return_value="C:/git/bash.exe"):
+            self.assertEqual(fwd._host_argv("bash launch.sh 1 49501")[0], "C:/git/bash.exe")
+        with mock.patch.object(fwd, "_git_bash", return_value=None):
+            self.assertEqual(fwd._host_argv("bash launch.sh 1 49501")[0], "bash")
+
+    def test_failed_spawn_is_reported_not_raised(self):
+        with mock.patch.object(fwd.subprocess, "Popen", side_effect=OSError("nope")):
+            self.assertIsNone(fwd._spawn_host(["no-such-exe"]))
+
+
+class SpawnFailedAssignTests(ForwarderCase):
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        fwd.TOKENS_FILE = os.path.join(self.tmp, "tokens.json")
+        with open(os.path.join(self.tmp, "presets.json"), "w", encoding="utf-8") as fh:
+            json.dump(PRESETS, fh)
+        fwd._load_presets()
+        fwd.FWD_GPU = 1
+
+    def test_assign_answers_spawn_failed(self):
+        with mock.patch.object(fwd, "_run_host", return_value=_completed()), \
+                mock.patch.object(fwd, "_spawn_host", return_value=None), \
+                mock.patch.object(fwd, "_git_bash", return_value=None):
+            self.assertEqual(fwd._assign_preset("llama-tune"), ("spawn-failed", 49501))
+
+    def test_assign_rereads_the_presets_file(self):
+        # a recipe added after startup is usable without a restart
+        extra = dict(PRESETS)
+        extra["late"] = {"kind": "process", "port": "4960{gpu}", "cmd": "bash late.sh {gpu} {port}"}
+        with open(os.path.join(self.tmp, "presets.json"), "w", encoding="utf-8") as fh:
+            json.dump(extra, fh)
+        with mock.patch.object(fwd, "_run_host", return_value=_completed()), \
+                mock.patch.object(fwd, "_spawn_host", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_git_bash", return_value=None):
+            self.assertEqual(fwd._assign_preset("late"), ("loading", 49601))

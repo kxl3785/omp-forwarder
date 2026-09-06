@@ -335,12 +335,61 @@ def _spawn_wsl(args: list[str]) -> subprocess.Popen:
                             stderr=subprocess.DEVNULL)
 
 
-def _spawn_host(args: list[str]) -> subprocess.Popen:
-    """Long-lived host child: the model server launched by --upstream-cmd.
-    Its own seam, so tests can assert what would be started without
-    starting anything."""
-    return subprocess.Popen(args, creationflags=_NO_WINDOW, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
+#: Git for Windows' bash, in the order it is usually installed. A bare
+#: `bash` in a launch command must mean THIS one: on a plain Windows PATH
+#: `bash` resolves to System32\bash.exe, which is WSL's, and a script given
+#: by its Windows path does not exist inside the distro -- the child exits
+#: at once with nothing on the forwarder's log (live 2026-09-05: assign
+#: answered "loading" twice and no server ever started).
+GIT_BASH_CANDIDATES = (
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files\Git\bin\bash.exe",
+)
+
+
+def _git_bash() -> str | None:
+    """Path of Git's bash when installed, else None. Its own seam so tests
+    on a box without Git, or with it, decide the outcome."""
+    for p in GIT_BASH_CANDIDATES:
+        if os.path.isfile(p):
+            return p
+    return None
+
+
+def _host_argv(cmd: str) -> list[str]:
+    """argv for a host launch command (a preset's "cmd", --upstream-cmd).
+
+    Split POSIX-style on every platform: a quoted path with spaces
+    ("C:/Program Files/Git/usr/bin/bash.exe") becomes ONE token with the
+    quotes removed, which `shlex.split(posix=False)` did not do -- it kept
+    the quotes on the token and CreateProcess then could not find the file.
+    Backslashes are normalised first so a Windows path survives the POSIX
+    escaping rules. A bare `bash` is Git's bash when present (see
+    GIT_BASH_CANDIDATES)."""
+    text = cmd.replace("\\", "/") if os.name == "nt" else cmd
+    argv = shlex.split(text, posix=True)
+    if argv and argv[0].lower() in ("bash", "bash.exe"):
+        gb = _git_bash()
+        if gb:
+            argv[0] = gb
+    return argv
+
+
+def _spawn_host(args: list[str]) -> subprocess.Popen | None:
+    """Long-lived host child: the model server launched by --upstream-cmd or
+    a process preset. Its own seam, so tests can assert what would be started
+    without starting anything. Logs what it starts, and a launch that cannot
+    start (missing executable, bad path) is logged and answered with None
+    instead of raising into the control handler."""
+    try:
+        child = subprocess.Popen(args, creationflags=_NO_WINDOW,
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+    except OSError as exc:
+        log(f"spawn failed: {exc!r} argv={args!r}")
+        return None
+    log(f"spawned pid {child.pid}: {' '.join(args)}")
+    return child
 
 
 def _poll_container_status(auto_start: bool = True) -> None:
@@ -1199,7 +1248,9 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     """Put preset `name` on this lane's GPU: unload what is there, launch the
     recipe with {gpu}/{port}/{name} filled, point the lane's upstream at the
     new port and let the existing wait-then-503 path cover the load. Returns
-    (status, port). Statuses: "loading", "no-gpu", "unknown-preset".
+    (status, port). Statuses: "loading", "no-gpu", "unknown-preset",
+    "spawn-failed" (a process recipe whose command could not start; the
+    forwarder log names the argv and the error).
 
     The lane's GPU comes from --gpu; a preset never chooses a card. Two
     lanes therefore give every arrangement: tune on one card and SGLang on
@@ -1208,6 +1259,13 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     global WSL_DISTRO, CONTAINER_NAME, _operator_stopped, _preset, _upstream_child
     if FWD_GPU is None:
         return "no-gpu", None
+    # Re-read the file on every assign: a recipe edited or added after the
+    # forwarder started is usable at once, without a restart of the lane.
+    # Only when the file exists -- a lane whose presets were set in memory
+    # (the tests) keeps them.
+    _pp = _presets_path()
+    if _pp and os.path.isfile(_pp):
+        _load_presets()
     p = _presets.get(name)
     if not p:
         return "unknown-preset", None
@@ -1215,8 +1273,9 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     port = _preset_port(p, gpu)
     _unload_current()
     if p["kind"] == "process":
-        _upstream_child = _spawn_host(
-            shlex.split(_render(p["cmd"], gpu, port), posix=(os.name != "nt")))
+        _upstream_child = _spawn_host(_host_argv(_render(p["cmd"], gpu, port)))
+        if _upstream_child is None:
+            return "spawn-failed", port
     else:
         cname = _render(p.get("container", "lane{gpu}"), gpu, port)
         distro = p["distro"]
@@ -1336,7 +1395,7 @@ def _control_action(action: str, timeout: float = 30.0) -> str:
             return "no-command"
         # posix=False on Windows keeps backslashes in paths intact.
         _upstream_child = _spawn_host(
-            shlex.split(UPSTREAM_CMD, posix=(os.name != "nt")))
+            _host_argv(UPSTREAM_CMD))
         _operator_stopped = False
         _save_latch()
         status = "starting"
@@ -1485,6 +1544,12 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
             reply("400 Bad Request", {"ok": False, "action": action,
                                       "error": "unknown preset",
                                       "presets": sorted(_presets)})
+        elif status == "spawn-failed":
+            reply("500 Internal Server Error",
+                  {"ok": False, "action": action, "preset": preset,
+                   "port": port,
+                   "error": "the recipe's command could not start; "
+                            "see the forwarder log"})
         else:
             reply("200 OK", {"ok": True, "action": action, "status": status,
                              "preset": preset, "port": port})
