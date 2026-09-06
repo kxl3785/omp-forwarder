@@ -284,6 +284,8 @@ def snapshot(fwd, stats: dict) -> dict:
         # The /__control token, so the dashboard can authorise its buttons.
         # See forwarder._control_token for why exposing it is safe.
         "control_token": getattr(fwd, "_control_token", None),
+        # Whether a missing upstream falls back to Studio (off by default).
+        "studio_fallback": bool(getattr(fwd, "STUDIO_FALLBACK", False)),
         # The operator pressed stop; auto-start stays off until start.
         "operator_stopped": bool(getattr(fwd, "_operator_stopped", False)),
         # PID behind a process upstream, from the netstat scan; null for a
@@ -792,11 +794,13 @@ async function tick(){
   // --- bar ---
   $("listen").textContent="127.0.0.1:"+s.listen;
   _ctrlToken=s.control_token||"";
-  $("up").textContent=s.upstream?("127.0.0.1:"+s.upstream):"Studio :8888 (fallback)";
+  // No upstream means 503 with Retry-After, not a silent hop to Studio,
+  // unless --studio-fallback was given: say which.
+  $("up").textContent=s.upstream?("127.0.0.1:"+s.upstream):(s.studio_fallback?"Studio :8888 (fallback)":"none");
   $("up").title = s.upstream_exe || "";
   $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.healthy?"on":"off");
-  $("state").textContent=s.healthy?"ready":(s.upstream?"unreachable":"no direct server");
+  $("state").textContent=s.healthy?"ready":(s.upstream?"unreachable":"no server");
   // The whole Container bit, label included, exists only in container mode.
   // A lane fronting a plain llama-server showed an empty "CONTAINER" label.
   $("contbit").hidden=!s.container_name;
