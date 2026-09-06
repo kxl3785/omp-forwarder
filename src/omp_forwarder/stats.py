@@ -281,6 +281,25 @@ def merge_snapshots(own: dict, peers: list) -> dict:
     return out
 
 
+def _launch_failed(fwd) -> bool:
+    """True when a preset is assigned, the upstream is not healthy, and what
+    was launched is no longer running. Read-only: a container status the
+    monitor last polled, and a poll() on the launcher's Popen."""
+    if not getattr(fwd, "_preset", None) or getattr(fwd, "_upstream_healthy", False):
+        return False
+    if getattr(fwd, "_operator_stopped", False):
+        return False
+    if getattr(fwd, "CONTAINER_NAME", None):
+        return getattr(fwd, "_container_status", None) == "exited"
+    child = getattr(fwd, "_upstream_child", None)
+    if child is None:
+        return False
+    try:
+        return child.poll() is not None
+    except Exception:
+        return False
+
+
 def snapshot(fwd, stats: dict) -> dict:
     """One JSON sample. Cumulative counters are returned raw -- the page
     differences successive samples for live rates, and differences a stored
@@ -375,7 +394,14 @@ def snapshot(fwd, stats: dict) -> dict:
         "preset": getattr(fwd, "_preset", None),
         "loading": bool(getattr(fwd, "_preset", None)
                         and not getattr(fwd, "_upstream_healthy", False)
-                        and not getattr(fwd, "_operator_stopped", False)),
+                        and not getattr(fwd, "_operator_stopped", False)
+                        and not _launch_failed(fwd)),
+        # The assigned server is gone: its container exited, or the process
+        # the launcher started has already returned. Live 2026-09-05 20:52:
+        # an SGLang preset died in seconds (no room for its KV cache beside
+        # another model) and the page said "loading..." for as long as anyone
+        # cared to watch. A failed launch must read as failed.
+        "launch_failed": _launch_failed(fwd),
         # --- forwarder-only: /metrics has no error counter ---
         "conns": stats.get("conns", 0),
         "requests": stats.get("requests", 0),
@@ -1148,9 +1174,9 @@ async function tick(){
     row.querySelector(".ln").innerHTML=(l.self?"<b>"+nm+"</b> <span class=\"pfx\">this page</span>"
       :'<a href="http://127.0.0.1:'+esc(l.port)+'/__stats">'+nm+'</a>')+' <span class="pfx">:'+esc(l.port)+'</span>';
     row.querySelector(".lg").textContent=(l.gpu===null||l.gpu===undefined)?"no gpu":("GPU "+l.gpu);
-    const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"unhealthy"))):"none assigned");
+    const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"failed \u00b7 not running"))):"none assigned");
     const lp=row.querySelector(".lp"); lp.textContent=(l.preset||"\u2014")+" \u00b7 "+st;
-    lp.className="lp "+(st==="serving"?"ok":(st==="loading\u2026"?"warn":(st==="unreachable"||st==="unhealthy"?"bad":"dim")));
+    lp.className="lp "+(st==="serving"?"ok":(st==="loading\u2026"?"warn":(st==="unreachable"||st.startsWith("failed")?"bad":"dim")));
     row.querySelector(".lm").textContent=l.model||"";
     row.querySelectorAll("button").forEach(b=>{
       b.disabled=!!l.loading||!l.reachable;

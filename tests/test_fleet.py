@@ -350,3 +350,46 @@ class FleetJsonTests(RelayCase):
             d = self._get("/__stats.json")
         g.assert_not_called()
         self.assertEqual(d["requests"], 2)
+
+
+class LaunchFailedTests(ForwarderCase):
+    """A dead launch reads as failed, not as loading."""
+
+    def setUp(self):
+        super().setUp()
+        fwd._preset = "sglang-nothink"
+        fwd._upstream_healthy = False
+        fwd._operator_stopped = False
+
+    def test_exited_container_is_failed_not_loading(self):
+        fwd.WSL_DISTRO, fwd.CONTAINER_NAME = "d", "sgl1"
+        fwd._container_status = "exited"
+        s = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertTrue(s["launch_failed"])
+        self.assertFalse(s["loading"])
+
+    def test_running_container_is_still_loading(self):
+        fwd.WSL_DISTRO, fwd.CONTAINER_NAME = "d", "sgl1"
+        fwd._container_status = "running"
+        s = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertFalse(s["launch_failed"])
+        self.assertTrue(s["loading"])
+
+    def test_returned_process_is_failed(self):
+        fwd._upstream_child = mock.Mock(poll=mock.Mock(return_value=2))
+        s = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertTrue(s["launch_failed"])
+        self.assertFalse(s["loading"])
+
+    def test_live_process_is_loading(self):
+        fwd._upstream_child = mock.Mock(poll=mock.Mock(return_value=None))
+        s = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertFalse(s["launch_failed"])
+        self.assertTrue(s["loading"])
+
+    def test_stopped_lane_is_neither(self):
+        fwd._operator_stopped = True
+        fwd._upstream_child = mock.Mock(poll=mock.Mock(return_value=1))
+        s = stats.snapshot(fwd, dict(fwd._stats))
+        self.assertFalse(s["launch_failed"])
+        self.assertFalse(s["loading"])
