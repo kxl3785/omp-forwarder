@@ -83,6 +83,10 @@ def note_slots(slots: list, now: float) -> None:
                 _finish(sid, h)
             h = {"task": task, "decoded": dec, "prompt": sl.get("prompt", 0),
                  "cached": sl.get("cached", 0), "t0": now, "t": now,
+                 # The decode clock starts at the first token, not when the
+                 # slot took the request: see _finish.
+                 "t_dec": now if (busy and dec > 0) else None,
+                 "dec0": dec if (busy and dec > 0) else 0,
                  "seen": 1 if busy else 0,
                  # The task a slot happens to carry when this watcher starts
                  # finished before anyone was looking. Seeds never report.
