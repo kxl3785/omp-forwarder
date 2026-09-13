@@ -1907,7 +1907,11 @@ function renderSlots(s){
         +`<td>${who}</td>`
         +`<td class="dim">${on?"running":"idle"}${(on&&i===0&&lr.queued>0)?(" \u00b7 "+lr.queued+" queued"):""}</td>`
         +`<td class="rate">${on&&share>0?fmt(share):em}</td>`
-        +`<td>${on?'1 <span class="dim">req</span>':em}</td>`
+        // The column holds TOKENS everywhere else in this table. It used to
+        // hold a request count on a lane row, which read as "1 generated".
+        // NInfer publishes no per-stream token count in flight, so the
+        // honest entry is nothing at all.
+        +`<td>${em}</td>`
         +`<td>${on?Math.round(lr.ctx).toLocaleString():em}</td>`
         +`<td>${on?(Math.round(100*(lr.cached||0))+"%"):em}</td>`
         +`<td class="dim">${on?("KV "+Math.round(100*(lr.kv||0))+"%"):em}</td>`

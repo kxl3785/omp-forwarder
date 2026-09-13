@@ -356,3 +356,14 @@ class LaneStreamUsageTests(ForwarderCase):
         row = [r for r in s["lane_rows"] if r.get("engine") == "ninfer"][0]
         self.assertEqual(row["streams"], 2)
         self.assertEqual(row["running"], 1)
+
+
+class GeneratedColumnTests(ForwarderCase):
+    """The GENERATED column holds tokens, on every row."""
+
+    def test_no_row_puts_a_request_count_in_the_tokens_column(self):
+        # It read "1 req" under a heading that means tokens everywhere else.
+        # NInfer publishes no per-stream token count in flight, so a stream
+        # row leaves it empty rather than filling it with something else.
+        self.assertNotIn('<span class="dim">req</span>', stats.PAGE)
+        self.assertNotIn('<span class="dim">reqs</span>', stats.PAGE)
