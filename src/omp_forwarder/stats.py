@@ -265,6 +265,10 @@ def upstream_model(port: int | None) -> str:
 # {} and the lane shows what it showed before: nothing invented.
 NINFER_TAIL_BYTES = 256 * 1024
 NINFER_STALE_S = 30.0
+#: How far back the live decode rate looks for finished requests. Long enough
+#: that a lane between short replies still shows a rate, short enough that the
+#: card means "now" and not "this session".
+NINFER_LIVE_WINDOW_S = 60.0
 
 
 def _ninfer_tail(path: str, tail_bytes: int, reader=None) -> list:
@@ -363,8 +367,41 @@ def ninfer_log_stats(path: str | None, now: float | None = None,
             "waiting": sch.get("waiting", 0) if fresh else 0,
             "age_s": round(age, 1),
         }
+        # The engine's periodic decode rate averages over the whole interval,
+        # prefill time included, so a window that straddles a prefill is
+        # mostly prefill: true of the window and badly wrong about the
+        # stream. This is the llama-server mistake in "Two rate bugs already
+        # fixed" wearing another engine's clothes. Measured 2026-09-13 over
+        # an hour of real traffic on the GPU 0 lane: windows that also
+        # prefilled read 44.0 tok/s while the requests finishing inside them
+        # ran at 184.9, and 570 of 588 windows contained a prefill -- so the
+        # card was almost always showing the diluted figure.
+        #
+        # The live rate therefore comes from decode time: tokens generated
+        # over decode seconds, across the requests that finished in the last
+        # minute. That is the same arithmetic the Recent list shows, which is
+        # why the two now agree. A window with no prefill in it is undiluted
+        # and stands in when nothing has finished recently.
+        gen_sum = dec_sum = 0.0
+        for ev in done:
+            ts = (ev.get("timestamp_unix_ms") or 0) / 1000.0
+            if now - ts > NINFER_LIVE_WINDOW_S:
+                continue
+            res = ev.get("result") or {}
+            tim = ev.get("timings_seconds") or {}
+            g, d = res.get("completion_tokens", 0), tim.get("decode") or 0.0
+            if d > 0 and g > 1:
+                gen_sum += g - 1
+                dec_sum += d
+        if dec_sum > 0:
+            decode = gen_sum / dec_sum
+        elif not (rates.get("prefill") or 0.0):
+            decode = rates.get("decode", 0.0)      # undiluted window
+        else:
+            decode = 0.0
         out["rates"] = {
-            "decode": rates.get("decode", 0.0) if fresh else 0.0,
+            "decode": decode if fresh else 0.0,
+            # Prefill is measured over prefill work and needs no such care.
             "prefill": rates.get("prefill", 0.0) if fresh else 0.0,
         }
 

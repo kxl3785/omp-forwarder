@@ -76,7 +76,54 @@ class NinferLogTests(unittest.TestCase):
         d = stats.ninfer_log_stats("x", now=now, reader=self._read(events))
         self.assertEqual(d["scheduler"]["running"], 3)
         self.assertEqual(d["scheduler"]["waiting"], 1)
-        self.assertEqual(d["rates"]["decode"], 180.5)
+        # The scheduler counts are the engine's and are trusted. The rate in
+        # that same record is not: see the decode-rate tests below.
+        self.assertEqual(d["scheduler"]["prefilling"], 0)
+
+    def test_an_undiluted_window_sets_the_decode_rate(self):
+        # No prefill happened in this window, so its average IS the stream.
+        now = 1000.0
+        d = stats.ninfer_log_stats(
+            "x", now=now,
+            reader=self._read([_tput(int((now - 2) * 1000), running=1,
+                                     decode=206.4, prefill=0.0)]))
+        self.assertEqual(d["rates"]["decode"], 206.4)
+
+    def test_a_window_that_also_prefilled_is_not_trusted(self):
+        """The engine averages over the whole interval, prefill included.
+
+        Measured 2026-09-13 over an hour of real traffic: windows carrying a
+        prefill read 44.0 tok/s while the requests finishing inside them ran
+        at 184.9, and 570 of 588 windows carried one. Reporting that number
+        is the llama-server prefill bug in another engine's clothes."""
+        now = 1000.0
+        d = stats.ninfer_log_stats(
+            "x", now=now,
+            reader=self._read([_tput(int((now - 2) * 1000), running=1,
+                                     decode=44.0, prefill=4200.0)]))
+        self.assertEqual(d["rates"]["decode"], 0.0)
+        # Prefill is measured over prefill work and needs no such care.
+        self.assertEqual(d["rates"]["prefill"], 4200.0)
+
+    def test_the_live_rate_comes_from_decode_time(self):
+        # 200 tokens over 1.0 s and 400 over 2.0 s is 199.3 tok/s over decode
+        # time, whatever the engine's diluted window says.
+        now = 1000.0
+        events = [_done(int((now - 10) * 1000), 1, 500, 400, 200, 1.0),
+                  _done(int((now - 5) * 1000), 2, 500, 400, 400, 2.0),
+                  _tput(int((now - 2) * 1000), running=1,
+                        decode=44.0, prefill=4200.0)]
+        d = stats.ninfer_log_stats("x", now=now, reader=self._read(events))
+        self.assertAlmostEqual(d["rates"]["decode"], 598 / 3.0, places=3)
+
+    def test_a_request_outside_the_window_does_not_set_the_rate(self):
+        now = 1000.0
+        old = now - stats.NINFER_LIVE_WINDOW_S - 30
+        events = [_done(int(old * 1000), 1, 500, 400, 200, 1.0),
+                  _tput(int((now - 2) * 1000), running=1,
+                        decode=44.0, prefill=4200.0)]
+        d = stats.ninfer_log_stats("x", now=now, reader=self._read(events))
+        self.assertEqual(d["rates"]["decode"], 0.0)
 
     def test_a_stale_record_reports_idle_rather_than_an_old_number(self):
         """A forwarder that outlives its engine must not show last hour's rate."""
