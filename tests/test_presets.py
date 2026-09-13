@@ -534,3 +534,94 @@ class KvPlanSurvivesRestartTests(ForwarderCase):
         fwd._kv_plan = {"tokens": 1}
         fwd._load_latch()
         self.assertEqual(fwd._kv_plan, {})
+
+
+_NETSTAT = """
+  Proto  Local Address          Foreign Address        State           PID
+  TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       968
+  TCP    127.0.0.1:49610        0.0.0.0:0              LISTENING       4321
+  TCP    127.0.0.1:49611        0.0.0.0:0              LISTENING       4321
+  TCP    127.0.0.1:49612        127.0.0.1:5000         TIME_WAIT       0
+"""
+
+
+class FreshContainerPortTests(ForwarderCase):
+    """A container publishes a port that has never been published before.
+
+    WSL2 kept a forward after the container was gone, twice on 2026-09-13.
+    Republishing the same number left two listeners for it and every connect
+    went to the dead one, so the engine served inside the distro and the lane
+    read "loading" until WSL itself was restarted."""
+
+    def setUp(self):
+        super().setUp()
+        fwd.FWD_GPU = 1
+
+    def test_a_pinned_port_is_used_as_written(self):
+        self.assertEqual(fwd._preset_port({"port": "4960{gpu}"}, 1), 49601)
+        self.assertEqual(fwd._launch_port({"port": "4960{gpu}"}, 1), 49601)
+
+    def test_auto_means_no_pinned_port(self):
+        for raw in ("auto", "AUTO", "", 0, "0"):
+            self.assertIsNone(fwd._preset_port({"port": raw}, 1), raw)
+
+    def test_a_fresh_port_skips_every_listener(self):
+        with mock.patch.object(fwd, "_run_host", return_value=_completed(_NETSTAT)), \
+                mock.patch.object(fwd, "_taken_ports", return_value=set()):
+            for _ in range(60):
+                port = fwd._free_container_port()
+                self.assertNotIn(port, (49610, 49611))
+                self.assertTrue(fwd.CONTAINER_PORT_LO <= port <= fwd.CONTAINER_PORT_HI)
+
+    def test_a_fresh_port_skips_a_peer_lane(self):
+        with mock.patch.object(fwd, "_run_host", return_value=_completed("")), \
+                mock.patch.object(fwd, "_taken_ports", return_value={49700}):
+            for _ in range(60):
+                self.assertNotEqual(fwd._free_container_port(), 49700)
+
+    def test_a_port_is_only_skipped_while_it_listens(self):
+        # TIME_WAIT is not a listener: the port is free and must stay usable,
+        # or a busy box would exhaust the range in an afternoon.
+        with mock.patch.object(fwd, "_run_host", return_value=_completed(_NETSTAT)), \
+                mock.patch.object(fwd, "_taken_ports", return_value=set()):
+            seen = {fwd._free_container_port() for _ in range(400)}
+        self.assertIn(49612, seen)
+
+    def test_no_free_port_is_reported_not_guessed(self):
+        full = "\n".join(
+            f"  TCP    127.0.0.1:{p}   0.0.0.0:0   LISTENING   1"
+            for p in range(fwd.CONTAINER_PORT_LO, fwd.CONTAINER_PORT_HI + 1))
+        with mock.patch.object(fwd, "_run_host", return_value=_completed(full)), \
+                mock.patch.object(fwd, "_taken_ports", return_value=set()):
+            self.assertIsNone(fwd._free_container_port())
+
+    def test_each_launch_gets_a_different_port(self):
+        # The whole point: two launches of one recipe must never republish
+        # the same number, because that is what goes stale.
+        fwd._presets = {"eng": dict(SIZED, port="auto")}
+        ports = []
+        for _ in range(6):
+            with mock.patch.object(fwd.time, "sleep"), \
+                    mock.patch.object(fwd, "_run_host",
+                                      return_value=_completed("32000, 32768\n")), \
+                    mock.patch.object(fwd, "_run_wsl", return_value=_completed("")), \
+                    mock.patch.object(fwd, "_spawn_wsl", return_value=mock.Mock()), \
+                    mock.patch.object(fwd, "_ports_with_listeners", return_value=set()), \
+                    mock.patch.object(fwd, "_await_container", return_value="running"):
+                status, port = fwd._assign_preset("eng")
+            self.assertEqual(status, "loading")
+            ports.append(port)
+        self.assertEqual(len(set(ports)), len(ports), ports)
+
+    def test_the_lane_fronts_the_port_it_launched(self):
+        fwd._presets = {"eng": dict(SIZED, port="auto")}
+        with mock.patch.object(fwd.time, "sleep"), \
+                mock.patch.object(fwd, "_run_host",
+                                  return_value=_completed("32000, 32768\n")), \
+                mock.patch.object(fwd, "_run_wsl", return_value=_completed("")), \
+                mock.patch.object(fwd, "_spawn_wsl", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_ports_with_listeners", return_value=set()), \
+                mock.patch.object(fwd, "_await_container", return_value="running"):
+            status, port = fwd._assign_preset("eng")
+        self.assertEqual(fwd.FORCED_UPSTREAM, port)
+        self.assertEqual(fwd._upstream, port)

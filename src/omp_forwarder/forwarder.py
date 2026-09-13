@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import re
 import secrets
 import shlex
@@ -585,7 +586,10 @@ def _sample_ninfer_log() -> None:
     if not path and _preset and FWD_GPU is not None:
         # A forwarder that restarted and adopted a latched preset never ran
         # the assign that sets the path, so derive it from the recipe.
-        path = _preset_log(_presets.get(_preset) or {}, int(FWD_GPU))
+        # FORCED_UPSTREAM, not the recipe's port: with a fresh port per
+        # launch the recipe no longer knows which one this lane got.
+        path = _preset_log(_presets.get(_preset) or {}, int(FWD_GPU),
+                           FORCED_UPSTREAM)
     if not path:
         _ninfer_stats = {}
         return
@@ -1358,8 +1362,77 @@ def _render(template, gpu: int, port: int | None = None, name: str = "",
     return s.replace("{name}", name)
 
 
-def _preset_port(p: dict, gpu: int) -> int:
-    return int(_render(p.get("port", 0), gpu))
+def _preset_port(p: dict, gpu: int) -> int | None:
+    """The port a preset pins, or None when it asks for a fresh one.
+
+    Pure: it allocates nothing, so a caller that only wants to know which
+    card a recipe belongs to cannot burn a port as a side effect."""
+    raw = str(_render(p.get("port", 0), gpu)).strip().lower()
+    if raw in ("auto", "", "0"):
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _ports_with_listeners() -> set[int]:
+    """Every TCP port with a listener on this machine, from one netstat pass.
+
+    A stale WSL forward is a LISTENING socket owned by the WSL relay that
+    answers nothing. It cannot be told from a live one by connecting -- a
+    connect to it times out, and so does a connect to a genuinely closed
+    port on this box. What can be seen is that the port is taken at all."""
+    if os.name != "nt":
+        return set()
+    res = _run_host(["netstat", "-ano", "-p", "TCP"], timeout=30)
+    if res is None:
+        return set()
+    out: set[int] = set()
+    for line in res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[-2] == "LISTENING":
+            try:
+                out.add(int(parts[1].rsplit(":", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+    return out
+
+
+#: Where a fresh container port comes from. Above the presets' own 4950x and
+#: 4960x conventions and below the top of the ephemeral range.
+CONTAINER_PORT_LO = 49610
+CONTAINER_PORT_HI = 49990
+
+
+def _free_container_port() -> int | None:
+    """A port no listener holds, for a container that is about to publish.
+
+    WSL2 forwards a published container port to Windows localhost, and twice
+    on 2026-09-13 it kept the forward after the container was gone. The next
+    launch republished the SAME port, netstat showed two listeners for it,
+    and every connect went to the dead one: the engine was serving inside
+    the distro and the lane read "loading" for as long as anyone watched.
+    A restart of the container did not clear it; only a restart of WSL did,
+    and that unloads the other card's model too.
+
+    A port that has never been published has no forward to go stale, so a
+    fresh one each launch sidesteps the whole failure."""
+    busy = _ports_with_listeners() | _taken_ports()
+    span = list(range(CONTAINER_PORT_LO, CONTAINER_PORT_HI + 1))
+    random.shuffle(span)
+    for port in span:
+        if port not in busy:
+            return port
+    return None
+
+
+def _launch_port(p: dict, gpu: int) -> int | None:
+    """The port THIS launch will use: the preset's own, or a fresh one."""
+    pinned = _preset_port(p, gpu)
+    if pinned is not None:
+        return pinned
+    return _free_container_port()
 
 
 def _gpu_mem_mib(gpu: int) -> tuple[int, int] | None:
@@ -1631,7 +1704,13 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
         log(f"preset {name} needs {plan.get('needed_mib')} MiB on gpu {gpu} "
             f"and {plan.get('free_mib')} MiB are free; nothing launched")
         return "too-small", None
-    port = _preset_port(p, gpu)
+    # A fresh port per launch when the recipe does not pin one. See
+    # _free_container_port: republishing a port WSL still forwards is
+    # what left an engine serving inside the distro and unreachable
+    # from Windows, twice on 2026-09-13.
+    port = _launch_port(p, gpu)
+    if port is None:
+        return "no-port", None
     if p["kind"] == "process":
         # A process preset carries no sizing: nothing here chose its window.
         _kv_plan = {}
@@ -1935,6 +2014,12 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
                    "port": port,
                    "error": "the recipe's command could not start; "
                             "see the forwarder log"})
+        elif status == "no-port":
+            reply("409 Conflict",
+                  {"ok": False, "action": action, "preset": preset,
+                   "error": "no free port for the container: every port "
+                            f"from {CONTAINER_PORT_LO} to {CONTAINER_PORT_HI} "
+                            "already has a listener"})
         elif status == "too-small":
             # Nothing was launched and the lane is stopped. Give the two
             # numbers the operator needs to decide: free the card, or pick
