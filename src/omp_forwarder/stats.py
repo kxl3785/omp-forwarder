@@ -822,6 +822,15 @@ def snapshot(fwd, stats: dict) -> dict:
         # engine's boot record where it publishes one, otherwise the
         # slot count, which is llama-server's word for the same thing.
         "streams": (nin.get("streams", 0) or len(slots)),
+        # How many of them are decoding RIGHT NOW on this card. The
+        # In Flight card can only show the fleet total, so with two
+        # lanes it cannot say which card is busy. This is per lane and
+        # travels to the peer, so one page answers for both.
+        "streams_busy": ((nin.get("scheduler") or {}).get("running", 0)
+                         if nin else
+                         sum(1 for sl in slots if sl.get("busy"))),
+        "streams_queued": ((nin.get("scheduler") or {}).get("waiting", 0)
+                           if nin else 0),
         "loading": bool(getattr(fwd, "_preset", None)
                         and not getattr(fwd, "_upstream_healthy", False)
                         and not getattr(fwd, "_operator_stopped", False)
@@ -981,6 +990,9 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
    desktop, and the operator has no way to tell which one they are using. */
 .lane .lkv{color:var(--dim)}
 .lane .lkv b{color:var(--ink);font-weight:600}
+/* A card with work on it reads green, so a glance down the panel finds the
+   busy one without reading the numbers. */
+.lane .lkv b.busy{color:var(--green)}
 .lane .ln b{color:var(--ink);font-weight:600}
 .lane .ln a{color:var(--teal);text-decoration:none}
 .lane .ln a:hover{text-decoration:underline}
@@ -1702,7 +1714,8 @@ async function tick(){
   const lanesEl=$("lanes");
   const me={port:String(location.port||"80"),name:s.name,gpu:s.gpu,preset:s.preset,loading:s.loading,
     operator_stopped:s.operator_stopped,healthy:s.healthy,model:s.model,presets:s.presets||[],
-    kv_plan:s.kv_plan||{},streams:s.streams||0,reachable:true,self:true};
+    kv_plan:s.kv_plan||{},streams:s.streams||0,streams_busy:s.streams_busy||0,
+    streams_queued:s.streams_queued||0,reachable:true,self:true};
   const lanes=[me].concat((s.peers||[]).map(pp=>Object.assign({},pp,{port:String(pp.port)})));
   const lkey=lanes.map(l=>l.port+":"+(l.presets||[]).join(",")).join("|");
   if(lanesEl.dataset.built!==lkey){
@@ -1742,7 +1755,14 @@ async function tick(){
     // lane serving four until the row says which.
     const cell=[];
     if(kp.tokens) cell.push("KV <b>"+fmt(kp.tokens)+"</b>");
-    if(l.streams>0) cell.push("<b>"+l.streams+"</b> stream"+(l.streams===1?"":"s"));
+    // Busy of ceiling, for THIS card. The In Flight card can only show the
+    // fleet total, so with two lanes it cannot say which card is working.
+    if(l.streams>0){
+      const b=l.streams_busy||0;
+      cell.push('<b class="'+(b>0?"busy":"")+'">'+b+"/"+l.streams+"</b> stream"
+                +(l.streams===1?"":"s")
+                +(l.streams_queued>0?(" +"+l.streams_queued+" queued"):""));
+    }
     if(cell.length){
       kvEl.innerHTML=cell.join(" · ");
       const bits=[kp.why||""];

@@ -313,3 +313,30 @@ class NinferStreamCountTests(ForwarderCase):
         peer = {"listen": 8891, "ninfer": {"running": 0, "streams": 2}}
         m = stats.merge_snapshots(own, [peer])
         self.assertEqual(m["ninfer"]["streams"], 4)
+
+
+class LaneStreamUsageTests(ForwarderCase):
+    """How many streams each CARD is using, not the fleet total.
+
+    The In Flight card can only show the fleet, so with two lanes it cannot
+    say which card is working. The lane row answers per card, and carries the
+    figure to the peer so one page answers for both."""
+
+    def test_the_snapshot_reports_this_lane_s_busy_streams(self):
+        fwd._ninfer_stats = {"scheduler": {"running": 2, "waiting": 1},
+                             "streams": 2, "rates": {}}
+        s = stats.snapshot(fwd, fwd._stats)
+        self.assertEqual(s["streams_busy"], 2)
+        self.assertEqual(s["streams_queued"], 1)
+        self.assertEqual(s["streams"], 2)
+
+    def test_an_idle_lane_reports_zero_busy(self):
+        fwd._ninfer_stats = {"scheduler": {"running": 0, "waiting": 0},
+                             "streams": 4, "rates": {}}
+        s = stats.snapshot(fwd, fwd._stats)
+        self.assertEqual(s["streams_busy"], 0)
+        self.assertEqual(s["streams"], 4)
+
+    def test_the_lane_row_shows_busy_over_ceiling(self):
+        self.assertIn("l.streams_busy", stats.PAGE)
+        self.assertIn('"/"+l.streams', stats.PAGE)

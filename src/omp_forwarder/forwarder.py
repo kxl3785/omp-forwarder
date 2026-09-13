@@ -683,6 +683,11 @@ def _sample_peers() -> None:
                 # argument no engine here answers for over HTTP, so it
                 # travels with the window it shares a row with.
                 "streams": d.get("streams") or 0,
+                # And how many of them the peer is decoding right now. The
+                # In Flight card can only show the fleet total, so without
+                # this no page can say WHICH card is busy.
+                "streams_busy": d.get("streams_busy") or 0,
+                "streams_queued": d.get("streams_queued") or 0,
                 # The port the peer fronts, so this lane never takes it.
                 "upstream": d.get("upstream"),
             }
