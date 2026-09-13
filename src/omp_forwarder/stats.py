@@ -514,15 +514,30 @@ def upstream_facts(port: int | None) -> dict:
         facts["parallel"] = f"tp={tp} pp={pp}"
         facts["model_path"] = info.get("model_path", "") or ""
     elif engine == "llama-server":
-        # llama-server does not publish speculative or parallel; only the
-        # thinking flag, and only when it is present in the props.
+        # /props was rearranged. Build b10909 dropped "model" for a
+        # "model_path" and a "model_alias", and dropped "chat_template_kwargs"
+        # entirely; the sampler kept reading the old names and the whole
+        # Deployment row rendered as dashes beside a server that was plainly
+        # serving. Read every spelling, newest first: a build older than this
+        # one still answers, and the row is the operator's proof that the
+        # right model loaded.
+        params = ((props.get("default_generation_settings") or {})
+                  .get("params") or {})
         kw = props.get("chat_template_kwargs") or {}
         on = kw.get("enable_thinking")
+        # reasoning_format says how reasoning is DELIVERED, not whether the
+        # model reasons, so it must never answer this question. A build that
+        # does not say leaves it unknown.
         facts["thinking"] = "on" if on is True else ("off" if on is False
                                                      else "unknown")
-        facts["speculative"] = "unknown"
-        facts["parallel"] = ""
-        facts["model_path"] = props.get("model", "") or ""
+        spec = params.get("speculative.types")
+        facts["speculative"] = spec if spec else "unknown"
+        # --parallel is what sets total_slots, so the count IS the setting.
+        slots = props.get("total_slots")
+        facts["parallel"] = ("slots=%d" % slots) if slots else ""
+        facts["model_path"] = (props.get("model")
+                               or props.get("model_alias")
+                               or props.get("model_path") or "")
     else:
         facts["thinking"] = "unknown"
         facts["speculative"] = "none"

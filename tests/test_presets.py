@@ -599,23 +599,34 @@ class FreshContainerPortTests(ForwarderCase):
                 mock.patch.object(fwd, "_taken_ports", return_value=set()):
             self.assertIsNone(fwd._free_container_port())
 
-    def test_each_launch_gets_a_different_port(self):
-        # The whole point: two launches of one recipe must never republish
-        # the same number, because that is what goes stale.
+    def test_a_launch_never_reuses_a_port_that_is_still_listening(self):
+        """The whole point, and the real mechanism behind it.
+
+        A second launch avoids the first port because the first is LISTENING,
+        not because the draw happened to differ. Asserting six random draws
+        are distinct tests the birthday problem instead: six from 381 collide
+        about once in twenty-five runs, and this test duly failed in the full
+        suite while passing alone."""
         fwd._presets = {"eng": dict(SIZED, port="auto")}
-        ports = []
-        for _ in range(6):
+        busy = set()
+
+        def launch():
             with mock.patch.object(fwd.time, "sleep"), \
                     mock.patch.object(fwd, "_run_host",
                                       return_value=_completed("32000, 32768\n")), \
                     mock.patch.object(fwd, "_run_wsl", return_value=_completed("")), \
                     mock.patch.object(fwd, "_spawn_wsl", return_value=mock.Mock()), \
-                    mock.patch.object(fwd, "_ports_with_listeners", return_value=set()), \
+                    mock.patch.object(fwd, "_ports_with_listeners",
+                                      side_effect=lambda: set(busy)), \
                     mock.patch.object(fwd, "_await_container", return_value="running"):
                 status, port = fwd._assign_preset("eng")
             self.assertEqual(status, "loading")
-            ports.append(port)
-        self.assertEqual(len(set(ports)), len(ports), ports)
+            return port
+
+        for _ in range(6):
+            port = launch()
+            self.assertNotIn(port, busy, busy)
+            busy.add(port)          # that container now holds the port
 
     def test_the_lane_fronts_the_port_it_launched(self):
         fwd._presets = {"eng": dict(SIZED, port="auto")}

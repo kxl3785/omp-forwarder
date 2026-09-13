@@ -655,3 +655,53 @@ class PageMarkupTests(ForwarderCase):
         # spans the facts grid instead of truncating.
         self.assertIn(".facts .row.full", stats.PAGE)
         self.assertIn('class="row full"', stats.PAGE)
+
+
+class LlamaServerPropsShapeTests(ForwarderCase):
+    """/props was rearranged and the Deployment row went blank.
+
+    Build b10909 dropped "model" for "model_path" plus "model_alias", and
+    dropped "chat_template_kwargs" entirely. The sampler kept reading the old
+    names, so every column rendered a dash beside a server that was plainly
+    serving. Both shapes must read."""
+
+    def _props(self, body):
+        up = self.fake(lambda m, p, r: [
+            json_response(body) if p == "/props" else http_response(404)])
+        fwd._upstream = up.port
+        fwd._sample_upstream_facts()
+        return fwd._upstream_facts
+
+    def test_the_new_shape_reads(self):
+        f = self._props({
+            "model_path": "C:/hub/models--x/snapshots/3e8/model.gguf",
+            "model_alias": "esatapedico/Qwen3.8-27B-Cold-Fusion-GAIN-V1.1",
+            "total_slots": 2,
+            "default_generation_settings": {
+                "n_ctx": 262144,
+                "params": {"speculative.types": "none",
+                           "reasoning_format": "none"}}})
+        self.assertEqual(f["engine"], "llama-server")
+        self.assertEqual(f["model_path"],
+                         "esatapedico/Qwen3.8-27B-Cold-Fusion-GAIN-V1.1")
+        self.assertEqual(f["speculative"], "none")
+        self.assertEqual(f["parallel"], "slots=2")
+
+    def test_reasoning_format_never_answers_the_thinking_question(self):
+        # It says how reasoning is DELIVERED, not whether the model reasons.
+        # Reading "none" as "thinking off" would put a red chip on a lane
+        # that is thinking.
+        f = self._props({"model_alias": "m", "total_slots": 1,
+                         "default_generation_settings": {
+                             "params": {"reasoning_format": "none"}}})
+        self.assertEqual(f["thinking"], "unknown")
+
+    def test_the_old_shape_still_reads(self):
+        f = self._props({"model": "Qwen-27B-GGUF",
+                         "chat_template_kwargs": {"enable_thinking": True}})
+        self.assertEqual(f["model_path"], "Qwen-27B-GGUF")
+        self.assertEqual(f["thinking"], "on")
+
+    def test_a_path_stands_in_when_there_is_no_alias(self):
+        f = self._props({"model_path": "/models/a.gguf", "total_slots": 1})
+        self.assertEqual(f["model_path"], "/models/a.gguf")

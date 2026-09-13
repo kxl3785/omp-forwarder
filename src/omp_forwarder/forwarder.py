@@ -997,10 +997,14 @@ def _taken_ports() -> set[int]:
         for p in _presets.values():
             for g in range(8):
                 if g != int(FWD_GPU):
+                    # None means the recipe asks for a fresh port each
+                    # launch, so there is no fixed number to keep away from.
                     try:
-                        taken.add(_preset_port(p, g))
+                        fixed = _preset_port(p, g)
                     except (TypeError, ValueError):
-                        pass
+                        fixed = None
+                    if fixed is not None:
+                        taken.add(fixed)
     return taken
 
 
