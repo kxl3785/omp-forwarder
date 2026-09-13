@@ -282,3 +282,34 @@ class NinferTokenTallyTests(ForwarderCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NinferStreamCountTests(ForwarderCase):
+    """How many requests the engine decodes at once, and where it shows.
+
+    It is a launch argument, fixed for the life of the process, and no engine
+    here answers for it over HTTP. A lane serving one at a time looks
+    identical to a lane serving four until the page says which."""
+
+    def _read(self, events):
+        return lambda path, n: "\n".join(json.dumps(e) for e in events)
+
+    def test_the_stream_count_comes_from_the_boot_record(self):
+        d = stats.ninfer_log_stats(
+            "x", now=10.0, reader=self._read([_start(max_concurrency=2)]))
+        self.assertEqual(d["streams"], 2)
+
+    def test_an_engine_that_does_not_say_reports_none(self):
+        d = stats.ninfer_log_stats("x", now=10.0, reader=self._read([_start()]))
+        self.assertEqual(d["streams"], 0)
+
+    def test_the_lane_row_and_the_in_flight_card_show_it(self):
+        self.assertIn("stream", stats.PAGE)
+        self.assertIn("NIN.streams", stats.PAGE)
+        self.assertIn("l.streams", stats.PAGE)
+
+    def test_the_fleet_adds_the_lanes_up(self):
+        own = {"listen": 8890, "ninfer": {"running": 1, "streams": 2}}
+        peer = {"listen": 8891, "ninfer": {"running": 0, "streams": 2}}
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual(m["ninfer"]["streams"], 4)

@@ -354,6 +354,12 @@ def ninfer_log_stats(path: str | None, now: float | None = None,
         # it is shared by every request and every retained prefix.
         out["ctx"] = eng.get("max_context") or eng.get("effective_max_context") or 0
         out["kv_capacity"] = eng.get("kv_capacity") or 0
+        # How many requests this engine will decode at once. A launch
+        # argument, fixed for the life of the process, and the reason the
+        # In Flight card reads "1" and stays there: a second request queues
+        # rather than joining. It also sets the cache ceiling, which is
+        # streams x context, so it belongs beside the window on the row.
+        out["streams"] = eng.get("max_concurrency") or 0
 
     # --- in flight, from the newest throughput record ---
     if tput:
@@ -592,7 +598,7 @@ def merge_snapshots(own: dict, peers: list) -> dict:
     if nins:
         merged = {}
         for k in ("running", "waiting", "decode", "prefill", "prompt",
-                  "cached", "drafted", "accepted"):
+                  "cached", "drafted", "accepted", "streams"):
             merged[k] = sum(n.get(k, 0) or 0 for n in nins)
         for k in ("ctx", "kv_capacity", "max_prompt"):
             merged[k] = max((n.get(k, 0) or 0) for n in nins)
@@ -736,6 +742,7 @@ def snapshot(fwd, stats: dict) -> dict:
             "accepted": tot.get("accepted", 0),
             "ctx": nin.get("ctx", 0),
             "kv_capacity": nin.get("kv_capacity", 0),
+            "streams": nin.get("streams", 0),
             "max_prompt": max((r.get("prompt", 0) for r in rec), default=0),
         }
     ensure_stream_watcher(fwd)
@@ -811,6 +818,10 @@ def snapshot(fwd, stats: dict) -> dict:
         # only witness -- and the operator needs to see which window a card
         # got, because it changes with whatever else is resident.
         "kv_plan": dict(getattr(fwd, "_kv_plan", {}) or {}),
+        # Concurrent streams this lane's engine will decode. From the
+        # engine's boot record where it publishes one, otherwise the
+        # slot count, which is llama-server's word for the same thing.
+        "streams": (nin.get("streams", 0) or len(slots)),
         "loading": bool(getattr(fwd, "_preset", None)
                         and not getattr(fwd, "_upstream_healthy", False)
                         and not getattr(fwd, "_operator_stopped", False)
@@ -1533,7 +1544,11 @@ async function tick(){
       ? "window · KV "+Math.round(100*(s.sglang_token_usage||0))+"%"
       : "tokens, high water";
   } else if(NIN){
-    $("inflight").textContent = Math.round(NIN.running);
+    // "1" alone cannot say whether the lane is saturated or barely used.
+    // The stream count is the ceiling, so the card reads "1 of 4" and an
+    // operator can see a queue forming before it forms.
+    $("inflight").textContent = NIN.streams>0
+      ? (Math.round(NIN.running)+" of "+NIN.streams) : Math.round(NIN.running);
     $("inflight_n").textContent = NIN.waiting>0 ? (NIN.waiting+" queued")
                                 : (NIN.running>0 ? "busy" : "idle");
     const ch = NIN.prompt>0 ? 100*NIN.cached/NIN.prompt : 0;
@@ -1687,7 +1702,7 @@ async function tick(){
   const lanesEl=$("lanes");
   const me={port:String(location.port||"80"),name:s.name,gpu:s.gpu,preset:s.preset,loading:s.loading,
     operator_stopped:s.operator_stopped,healthy:s.healthy,model:s.model,presets:s.presets||[],
-    kv_plan:s.kv_plan||{},reachable:true,self:true};
+    kv_plan:s.kv_plan||{},streams:s.streams||0,reachable:true,self:true};
   const lanes=[me].concat((s.peers||[]).map(pp=>Object.assign({},pp,{port:String(pp.port)})));
   const lkey=lanes.map(l=>l.port+":"+(l.presets||[]).join(",")).join("|");
   if(lanesEl.dataset.built!==lkey){
@@ -1720,8 +1735,16 @@ async function tick(){
     // an operator who sees 131k where they expected 262k needs the free
     // memory and the budget to know whether to close something or to wait.
     const kvEl=row.querySelector(".lkv"), kp=l.kv_plan||{};
-    if(kp.tokens){
-      kvEl.innerHTML="KV <b>"+fmt(kp.tokens)+"</b>";
+    // Streams belong beside the window, not in a card of their own: they are
+    // the other half of what the engine was told at launch, neither of them
+    // is readable back over HTTP, and together they set the cache ceiling
+    // (streams x context). A lane serving one at a time looks identical to a
+    // lane serving four until the row says which.
+    const cell=[];
+    if(kp.tokens) cell.push("KV <b>"+fmt(kp.tokens)+"</b>");
+    if(l.streams>0) cell.push("<b>"+l.streams+"</b> stream"+(l.streams===1?"":"s"));
+    if(cell.length){
+      kvEl.innerHTML=cell.join(" · ");
       const bits=[kp.why||""];
       if(kp.free_mib!==null&&kp.free_mib!==undefined) bits.push(fmt(kp.free_mib)+" MiB free at launch");
       if(kp.reserve_mib) bits.push(fmt(kp.reserve_mib)+" MiB held back for other tenants");

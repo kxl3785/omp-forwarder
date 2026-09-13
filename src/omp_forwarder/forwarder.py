@@ -679,6 +679,10 @@ def _sample_peers() -> None:
                 # behind it. A window is a launch decision no engine reports
                 # over HTTP, so it reaches the page only this way.
                 "kv_plan": d.get("kv_plan") or {},
+                # Concurrent streams the peer's engine decodes. A launch
+                # argument no engine here answers for over HTTP, so it
+                # travels with the window it shares a row with.
+                "streams": d.get("streams") or 0,
                 # The port the peer fronts, so this lane never takes it.
                 "upstream": d.get("upstream"),
             }
