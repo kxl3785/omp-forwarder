@@ -1375,6 +1375,27 @@ def _gpu_mem_mib(gpu: int) -> tuple[int, int] | None:
         return None
 
 
+def _gpu_mem_settled(gpu: int, tries: int = 14, pause: float = 0.4):
+    """(free, total) once the card has stopped giving memory back.
+
+    A preset launch unloads the lane first, and `docker rm -f` returns long
+    before the driver releases the model's 20 GiB. Measured 2026-09-13: a
+    lane re-assigned on GPU 0 read 4,595 MiB free with its own outgoing
+    container still resident, computed a negative budget, and fell to the
+    smallest rung on a card that was about to be nearly empty. Two readings
+    that agree mean the release is done."""
+    last = None
+    for _ in range(max(1, tries)):
+        cur = _gpu_mem_mib(gpu)
+        if cur is None:
+            return None
+        if last is not None and abs(cur[0] - last[0]) <= 256:
+            return cur
+        last = cur
+        time.sleep(pause)
+    return last
+
+
 def _plan_kv(p: dict, gpu: int) -> dict:
     """Choose this launch's KV window from what the card has free right now.
 
@@ -1401,7 +1422,7 @@ def _plan_kv(p: dict, gpu: int) -> dict:
                     reverse=True)
     if not ladder:
         return {}
-    mem = _gpu_mem_mib(gpu)
+    mem = _gpu_mem_settled(gpu)
     plan: dict = {"ladder": ladder,
                   "free_mib": None if mem is None else mem[0],
                   "tenant_floor_mib": int(sz.get("tenant_floor_mib", 0))}

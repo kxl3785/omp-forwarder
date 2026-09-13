@@ -310,7 +310,8 @@ class KvSizingTests(ForwarderCase):
                 settle="running"):
         fwd._presets = {"eng": preset}
         smi = _completed(f"{free}, {total}\n")
-        with mock.patch.object(fwd, "_run_host", return_value=smi), \
+        with mock.patch.object(fwd.time, "sleep"), \
+                mock.patch.object(fwd, "_run_host", return_value=smi), \
                 mock.patch.object(fwd, "_run_wsl",
                                   side_effect=lambda a, timeout=10.0:
                                   self.ran.append(a) or _completed()), \
@@ -415,3 +416,34 @@ class KvSizingTests(ForwarderCase):
                 mock.patch.object(fwd, "_run_wsl",
                                   return_value=_completed("false\n")):
             self.assertEqual(fwd._await_container("D", "c"), "exited")
+
+
+class GpuMemSettleTests(ForwarderCase):
+    """A card does not give its memory back the instant a container dies."""
+
+    def test_it_waits_for_two_readings_that_agree(self):
+        # docker rm -f returns long before the driver releases 20 GiB.
+        # Measured 2026-09-13: a lane re-assigned on GPU 0 read 4,595 MiB
+        # free with its own outgoing container still resident, computed a
+        # negative budget, and fell to the smallest rung on a card that was
+        # about to be nearly empty.
+        reads = ["4595, 32768\n", "18000, 32768\n",
+                 "31900, 32768\n", "32000, 32768\n"]
+        with mock.patch.object(fwd.time, "sleep"), \
+                mock.patch.object(fwd, "_run_host",
+                                  side_effect=[_completed(r) for r in reads]):
+            self.assertEqual(fwd._gpu_mem_settled(1), (32000, 32768))
+
+    def test_a_steady_card_is_read_twice_and_no_more(self):
+        calls = []
+        with mock.patch.object(fwd.time, "sleep"), \
+                mock.patch.object(fwd, "_run_host",
+                                  side_effect=lambda a, timeout=10.0:
+                                  calls.append(a) or _completed("30000, 32768\n")):
+            self.assertEqual(fwd._gpu_mem_settled(0), (30000, 32768))
+        self.assertEqual(len(calls), 2)
+
+    def test_an_unreadable_card_gives_up_at_once(self):
+        with mock.patch.object(fwd.time, "sleep"), \
+                mock.patch.object(fwd, "_run_host", return_value=None):
+            self.assertIsNone(fwd._gpu_mem_settled(0))
