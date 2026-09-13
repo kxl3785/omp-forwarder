@@ -1396,7 +1396,12 @@ def _gpu_mem_settled(gpu: int, tries: int = 14, pause: float = 0.4):
     return last
 
 
-def _plan_kv(p: dict, gpu: int) -> dict:
+#: "no reading was handed in", which is not the same as a reading of None --
+#: None means nvidia-smi itself could not be read.
+_UNREAD = object()
+
+
+def _plan_kv(p: dict, gpu: int, mem=_UNREAD) -> dict:
     """Choose this launch's KV window from what the card has free right now.
 
     An engine that sizes its cache once, at load, has to be told the right
@@ -1416,14 +1421,21 @@ def _plan_kv(p: dict, gpu: int) -> dict:
     through the day, and a lane that took the whole empty card would leave
     them unable to load. Only the SHORTFALL is held back -- whatever the
     tenant already holds is missing from `free` anyway, and reserving it a
-    second time would cost a rung for nothing."""
+    second time would cost a rung for nothing.
+
+    `mem` is a reading already taken, for a caller pricing several models
+    against the SAME card: reading it once keeps the settle wait off every
+    candidate and stops two candidates being priced against two different
+    cards."""
     sz = p.get("sizing") or {}
     ladder = sorted({int(t) for t in (sz.get("ladder") or []) if int(t) > 0},
                     reverse=True)
     if not ladder:
         return {}
-    mem = _gpu_mem_settled(gpu)
+    if mem is _UNREAD:
+        mem = _gpu_mem_settled(gpu)
     plan: dict = {"ladder": ladder,
+                  "fits": True,
                   "free_mib": None if mem is None else mem[0],
                   "tenant_floor_mib": int(sz.get("tenant_floor_mib", 0))}
     if mem is None:
@@ -1453,12 +1465,61 @@ def _plan_kv(p: dict, gpu: int) -> dict:
             plan["tokens"] = t
             plan["why"] = "largest rung this card affords"
             return plan
-    # Nothing fits. Launch the smallest anyway and let the engine say so in
-    # its own words: a refusal with a byte count in the log is worth more
-    # than a lane that was never started and has nothing to show.
+    # Nothing fits: this model is too big for this card today. Say what it
+    # would take, and leave the launch to the caller -- it may have a
+    # cheaper model to try before anyone gives up.
+    plan["fits"] = False
     plan["tokens"] = ladder[-1]
-    plan["why"] = "card affords no rung; smallest attempted"
+    plan["needed_mib"] = fixed + int(ladder[-1] * per_tok_kib / 1024)
+    plan["why"] = "card affords no rung"
     return plan
+
+
+def _fit_preset(name: str, gpu: int) -> tuple[str, dict, dict]:
+    """The recipe this card can actually pay for, and the KV plan that goes
+    with it. Returns (name, preset, plan).
+
+    A preset states which model it loads; the card states what it can hold.
+    When those two disagree, the lane used to launch anyway and die --
+    2026-09-13, both lanes read "loading" for minutes while the container
+    had already exited, and the operator had nothing to act on. So a preset
+    may name a cheaper recipe in `smaller`, and this walks that chain BEFORE
+    anything is launched: the card is read once and every model in the chain
+    is priced against that one reading.
+
+    `plan["fits"]` is False only when the chain ran out with nothing that
+    fits. The caller must then refuse rather than launch. A preset carrying
+    no `sizing` block prices as a fit, because nothing here knows its cost.
+
+    The card is read only when a candidate must actually be priced: a
+    process recipe, or one carrying no sizing, costs no nvidia-smi call and
+    no settle wait."""
+    mem: object = _UNREAD
+    first, seen = name, []
+    plan: dict = {}
+    p: dict = _presets.get(name) or {}
+    while name and name not in seen:
+        seen.append(name)
+        p = _presets.get(name) or {}
+        if not p:
+            break
+        if p.get("kind") == "process" or not (p.get("sizing") or {}):
+            return name, p, ({"asked": first} if name != first else {})
+        if mem is _UNREAD:
+            mem = _gpu_mem_settled(gpu)
+        plan = _plan_kv(p, gpu, mem)
+        if plan.get("fits", True):
+            break
+        nxt = str(p.get("smaller") or "").strip()
+        if not nxt or nxt in seen:
+            break
+        log(f"preset {name} does not fit gpu {gpu}: it needs "
+            f"{plan.get('needed_mib')} MiB and {plan.get('free_mib')} MiB "
+            f"are free. Trying {nxt}.")
+        name = nxt
+    if plan and name != first:
+        plan["asked"] = first
+    return name, p, plan
 
 
 def _await_container(distro: str, cname: str, grace: float = 12.0) -> str:
@@ -1521,7 +1582,14 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     new port and let the existing wait-then-503 path cover the load. Returns
     (status, port). Statuses: "loading", "no-gpu", "unknown-preset",
     "spawn-failed" (a process recipe whose command could not start; the
-    forwarder log names the argv and the error).
+    forwarder log names the argv and the error), and "too-small" (the card
+    cannot hold this model, nor any cheaper one the preset names -- nothing
+    was launched and the lane is left stopped).
+
+    The MODEL is chosen here too, not only the window: `_fit_preset` walks
+    the preset's `smaller` chain and returns the largest model this card can
+    serve today. So the recipe that lands may not be the one asked for, and
+    `_kv_plan["asked"]` names the one that was.
 
     The lane's GPU comes from --gpu; a preset never chooses a card. Two
     lanes therefore give every arrangement: tune on one card and SGLang on
@@ -1542,8 +1610,21 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     if not p:
         return "unknown-preset", None
     gpu = int(FWD_GPU)
-    port = _preset_port(p, gpu)
+    # Unload FIRST, then price: what this lane holds now is about to go, so
+    # it must not count against the model that replaces it.
     _unload_current()
+    name, p, plan = _fit_preset(name, gpu)
+    if plan.get("fits") is False:
+        # The chain ran out. Launching would give the operator a container
+        # that exits and a lane that reads "loading" for minutes, so say the
+        # two numbers instead and leave the lane stopped.
+        _kv_plan = plan
+        _operator_stopped = True
+        _save_latch()
+        log(f"preset {name} needs {plan.get('needed_mib')} MiB on gpu {gpu} "
+            f"and {plan.get('free_mib')} MiB are free; nothing launched")
+        return "too-small", None
+    port = _preset_port(p, gpu)
     if p["kind"] == "process":
         # A process preset carries no sizing: nothing here chose its window.
         _kv_plan = {}
@@ -1553,7 +1634,6 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     else:
         cname = _render(p.get("container", "lane{gpu}"), gpu, port)
         distro = p["distro"]
-        plan = _plan_kv(p, gpu)
         # Rungs to try, largest first. Two step-downs and no more: a third
         # attempt costs another twelve seconds on a button press, and if two
         # rungs below the estimate still will not fit then the card is not
@@ -1848,6 +1928,19 @@ def _serve_control(client: socket.socket, path: str, method: str) -> None:
                    "port": port,
                    "error": "the recipe's command could not start; "
                             "see the forwarder log"})
+        elif status == "too-small":
+            # Nothing was launched and the lane is stopped. Give the two
+            # numbers the operator needs to decide: free the card, or pick
+            # a smaller model.
+            need = _kv_plan.get("needed_mib")
+            free = _kv_plan.get("free_mib")
+            reply("409 Conflict",
+                  {"ok": False, "action": action, "preset": preset,
+                   "needed_mib": need, "free_mib": free,
+                   "kv_plan": dict(_kv_plan),
+                   "error": f"this card cannot hold that model: it needs "
+                            f"{need} MiB and {free} MiB are free. Nothing "
+                            f"was started."})
         else:
             reply("200 OK", {"ok": True, "action": action, "status": status,
                              "preset": preset, "port": port})

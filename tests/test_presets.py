@@ -308,7 +308,11 @@ class KvSizingTests(ForwarderCase):
 
     def _launch(self, preset: dict, free: int, total: int = 32768,
                 settle="running"):
-        fwd._presets = {"eng": preset}
+        return self._launch_many({"eng": preset}, "eng", free, total, settle)
+
+    def _launch_many(self, presets: dict, ask: str, free: int,
+                     total: int = 32768, settle="running"):
+        fwd._presets = presets
         smi = _completed(f"{free}, {total}\n")
         with mock.patch.object(fwd.time, "sleep"), \
                 mock.patch.object(fwd, "_run_host", return_value=smi), \
@@ -321,7 +325,7 @@ class KvSizingTests(ForwarderCase):
                                                else None),
                                   return_value=(None if isinstance(settle, list)
                                                 else settle)):
-            return fwd._assign_preset("eng")
+            return fwd._assign_preset(ask)
 
     def _run_line(self) -> str:
         return [a for a in self.ran if "bash" in a and "-c" in a][-1][-1]
@@ -354,13 +358,17 @@ class KvSizingTests(ForwarderCase):
         self.assertEqual(fwd._kv_plan["reserve_mib"], 0)
         self.assertEqual(fwd._kv_plan["others_mib"], 6768)
 
-    def test_no_rung_fits_so_the_smallest_is_attempted(self):
+    def test_no_rung_fits_and_no_cheaper_model_so_nothing_is_launched(self):
         # 3,500 MiB of budget buys 102k tokens and the ladder stops at 131k.
-        # Launching anyway puts the engine's own refusal in its log, which is
-        # worth more than a lane that was never started.
-        self._launch(_sized(), free=25000)
-        self.assertEqual(fwd._kv_plan["tokens"], 131072)
+        # Launching would hand the operator a container that exits and a
+        # lane that reads "loading" for minutes, so refuse and say so.
+        status, port = self._launch(_sized(), free=25000)
+        self.assertEqual((status, port), ("too-small", None))
+        self.assertFalse(fwd._kv_plan["fits"])
         self.assertIn("affords no rung", fwd._kv_plan["why"])
+        self.assertEqual(fwd._kv_plan["needed_mib"], 21500 + 4480)
+        self.assertTrue(fwd._operator_stopped)
+        self.assertEqual(self.ran, [])
 
     def test_an_unreadable_card_takes_the_smallest_window(self):
         fwd._presets = {"eng": _sized()}
@@ -388,6 +396,53 @@ class KvSizingTests(ForwarderCase):
         self.assertEqual(fwd._kv_plan["tokens"], 131072)
         runs = [a for a in self.ran if "bash" in a and "-c" in a]
         self.assertEqual(len(runs), 3)
+
+    def test_a_card_too_small_for_the_model_gets_the_cheaper_one(self):
+        # The card holds 25,000 MiB. The 20 GiB model cannot pay for its
+        # smallest window; the 14 GiB one can, so that is what lands.
+        big = _sized()
+        big["smaller"] = "small"
+        small = _sized(weights_mib=14000)
+        small["container"] = "small{gpu}"
+        status, _ = self._launch_many({"eng": big, "small": small},
+                                      "eng", free=25000)
+        self.assertEqual(status, "loading")
+        self.assertEqual(fwd._preset, "small")
+        self.assertEqual(fwd._kv_plan["asked"], "eng")
+        self.assertEqual(fwd._kv_plan["tokens"], 262144)
+        self.assertIn("--name small1", self._run_line())
+
+    def test_the_chain_runs_out_and_the_lane_stays_stopped(self):
+        big = _sized()
+        big["smaller"] = "small"
+        status, port = self._launch_many(
+            {"eng": big, "small": _sized(weights_mib=19000)},
+            "eng", free=21000)
+        self.assertEqual((status, port), ("too-small", None))
+        self.assertEqual(self.ran, [])
+        self.assertTrue(fwd._operator_stopped)
+
+    def test_a_chain_that_points_back_at_itself_does_not_loop(self):
+        a = _sized()
+        a["smaller"] = "b"
+        b = _sized(weights_mib=20100)
+        b["smaller"] = "eng"
+        status, _ = self._launch_many({"eng": a, "b": b}, "eng", free=21000)
+        self.assertEqual(status, "too-small")
+
+    def test_a_process_preset_is_never_priced(self):
+        # Pricing costs an nvidia-smi call and a settle wait. A recipe with
+        # no sizing has no price to compare, so it pays neither.
+        fwd._presets = {"eng": {"kind": "process", "port": "4950{gpu}",
+                                "cmd": "launch.sh {gpu} {port}"}}
+        host: list = []
+        with mock.patch.object(fwd, "_run_host",
+                               side_effect=lambda a, timeout=10.0:
+                               host.append(a) or _completed()), \
+                mock.patch.object(fwd, "_spawn_host", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_git_bash", return_value=None):
+            fwd._assign_preset("eng")
+        self.assertEqual([a for a in host if "nvidia-smi" in a[0]], [])
 
     def test_a_preset_without_sizing_is_launched_unchanged(self):
         fwd._presets = {"eng": {k: v for k, v in SIZED.items() if k != "sizing"}}
