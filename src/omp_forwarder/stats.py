@@ -722,6 +722,11 @@ def snapshot(fwd, stats: dict) -> dict:
             "cached": tot.get("cache_hit_rate", 0.0),
             "ctx": nin.get("ctx", 0),
             "kv": 0.0,
+            # How many streams this engine has, so the table can draw one
+            # row each and leave the empty ones empty. Without it the panel
+            # showed a single "whole lane" row and an operator could not see
+            # that a card had a stream to spare.
+            "streams": nin.get("streams", 0),
         })
     ninfer_block = None
     if nin:
@@ -1755,14 +1760,10 @@ async function tick(){
     // lane serving four until the row says which.
     const cell=[];
     if(kp.tokens) cell.push("KV <b>"+fmt(kp.tokens)+"</b>");
-    // Busy of ceiling, for THIS card. The In Flight card can only show the
-    // fleet total, so with two lanes it cannot say which card is working.
-    if(l.streams>0){
-      const b=l.streams_busy||0;
-      cell.push('<b class="'+(b>0?"busy":"")+'">'+b+"/"+l.streams+"</b> stream"
-                +(l.streams===1?"":"s")
-                +(l.streams_queued>0?(" +"+l.streams_queued+" queued"):""));
-    }
+    // The ceiling only. What is RUNNING belongs in the Per stream panel,
+    // which draws one row per stream and leaves the idle ones empty -- a
+    // fraction here said "1/2" without showing the shape of the work.
+    if(l.streams>0) cell.push("<b>"+l.streams+"</b> stream"+(l.streams===1?"":"s"));
     if(cell.length){
       kvEl.innerHTML=cell.join(" · ");
       const bits=[kp.why||""];
@@ -1837,6 +1838,10 @@ function recentHtml(s){
 function renderSlots(s){
   const rows=[], slots=(s.slots||[]).filter(x=>x.busy);
   let total=0, haveRate=false, decoding=0, prefilling=0;
+  // Streams an engine declares, and how many are working. Counted here so
+  // the panel note can say "2 of 4 streams busy" across the fleet, which is
+  // the same figure the rows below show one card at a time.
+  let lanesStreams=0, lanesBusy=0;
   for(const sl of slots){
     const h=slotHist.get(sl.id);
     // Also require the phase to be unchanged. A window that straddles the
@@ -1881,15 +1886,34 @@ function renderSlots(s){
   for(const lr of (s.lane_rows||[])){
     if(lr.rate>0){ total+=lr.rate; haveRate=true; }
     if(lr.running>0) decoding+=lr.running;
-    rows.push("<tr>"
-      +`<td><span class="dim">:${lr.lane} \u00b7 </span>${lr.engine} <span class="dim">whole lane</span></td>`
-      +`<td class="dim">${lr.running>0?"running":"idle"}${lr.queued>0?(" \u00b7 "+lr.queued+" queued"):""}</td>`
-      +`<td class="rate">${lr.rate>0?fmt(lr.rate):'<span class="dim">\u2014</span>'}</td>`
-      +`<td>${Math.round(lr.running)} <span class="dim">reqs</span></td>`
-      +`<td>${Math.round(lr.ctx).toLocaleString()}</td>`
-      +`<td>${Math.round(100*(lr.cached||0))}%</td>`
-      +`<td class="dim">KV ${Math.round(100*(lr.kv||0))}%</td>`
-      +"</tr>");
+    // An engine that says how many streams it has gets one row each, busy or
+    // not. An empty row is the point: "1 of 2" buried in a header does not
+    // show a card with a stream to spare, and a single "whole lane" row hid
+    // the shape of the work entirely.
+    const n = lr.streams>0 ? lr.streams : 1;
+    const busy = Math.max(0, Math.min(Math.round(lr.running), n));
+    // NInfer reports ONE decode rate for the lane, not one per stream. The
+    // per-stream figure is therefore that rate shared between the streams
+    // actually decoding, and the panel note says so. Never split it across
+    // idle streams: a stream doing nothing is not doing a share of the work.
+    const share = busy>0 ? lr.rate/busy : 0;
+    for(let i=0;i<n;i++){
+      const on = i<busy;
+      const who = lr.streams>0
+        ? `<span class="dim">:${lr.lane} \u00b7 </span>stream <b>${i+1}</b><span class="dim">/${n}</span>`
+        : `<span class="dim">:${lr.lane} \u00b7 </span>${lr.engine} <span class="dim">whole lane</span>`;
+      const em = '<span class="dim">\u2014</span>';
+      rows.push("<tr>"
+        +`<td>${who}</td>`
+        +`<td class="dim">${on?"running":"idle"}${(on&&i===0&&lr.queued>0)?(" \u00b7 "+lr.queued+" queued"):""}</td>`
+        +`<td class="rate">${on&&share>0?fmt(share):em}</td>`
+        +`<td>${on?'1 <span class="dim">req</span>':em}</td>`
+        +`<td>${on?Math.round(lr.ctx).toLocaleString():em}</td>`
+        +`<td>${on?(Math.round(100*(lr.cached||0))+"%"):em}</td>`
+        +`<td class="dim">${on?("KV "+Math.round(100*(lr.kv||0))+"%"):em}</td>`
+        +"</tr>");
+    }
+    lanesStreams += n; lanesBusy += busy;
   }
   const box=document.getElementById("slots");
   const note=document.getElementById("slots_n");
@@ -1899,9 +1923,14 @@ function renderSlots(s){
     note.textContent = (s.slots||[]).length ? ((s.slots||[]).length+" slots idle") : "";
     return out;
   }
-  const nlr=(s.lane_rows||[]).length;
-  note.textContent = (rows.length-nlr)+" of "+(s.slots||[]).length+" slots busy"
-    + (nlr ? (" \u00b7 "+nlr+" lane"+(nlr>1?"s":"")+" without /slots") : "");
+  const parts=[];
+  if(lanesStreams) parts.push(lanesBusy+" of "+lanesStreams+" streams busy");
+  if((s.slots||[]).length) parts.push(slots.length+" of "+(s.slots||[]).length+" slots busy");
+  // The rate an engine reports for a whole lane is shared out across its
+  // working streams. Say so: the column would otherwise read as a
+  // measurement of one stream, which nothing here measures.
+  if(lanesStreams) parts.push("lane rate shared across working streams");
+  note.textContent = parts.join(" \u00b7 ");
   box.innerHTML="<table><thead><tr>"
     +"<th>stream</th><th>phase</th><th>tok/s</th><th>generated</th>"
     +"<th>context</th><th>cached</th><th>budget left</th></tr></thead><tbody>"

@@ -337,6 +337,22 @@ class LaneStreamUsageTests(ForwarderCase):
         self.assertEqual(s["streams_busy"], 0)
         self.assertEqual(s["streams"], 4)
 
-    def test_the_lane_row_shows_busy_over_ceiling(self):
-        self.assertIn("l.streams_busy", stats.PAGE)
-        self.assertIn('"/"+l.streams', stats.PAGE)
+    def test_the_per_stream_panel_draws_one_row_per_stream(self):
+        # An empty row is the point: a fraction in a header cannot show that
+        # a card has a stream to spare.
+        self.assertIn("lr.streams>0", stats.PAGE)
+        self.assertIn("lanesBusy", stats.PAGE)
+        self.assertIn("streams busy", stats.PAGE)
+
+    def test_the_lane_row_names_the_ceiling_only(self):
+        self.assertIn("l.streams", stats.PAGE)
+        self.assertNotIn('"/"+l.streams', stats.PAGE)
+
+    def test_the_lane_row_of_the_table_carries_the_stream_count(self):
+        fwd._ninfer_stats = {"scheduler": {"running": 1, "waiting": 0},
+                             "streams": 2, "rates": {"decode": 200.0},
+                             "ctx": 131072, "totals": {"cache_hit_rate": 0.9}}
+        s = stats.snapshot(fwd, fwd._stats)
+        row = [r for r in s["lane_rows"] if r.get("engine") == "ninfer"][0]
+        self.assertEqual(row["streams"], 2)
+        self.assertEqual(row["running"], 1)
