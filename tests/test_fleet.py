@@ -286,12 +286,28 @@ class MergeSnapshotTests(ForwarderCase):
         self.assertEqual([(r["id"], r["lane"], r["slot"]) for r in m["slots"]],
                          [("8890:0", 8890, 0), ("8891:0", 8891, 0)])
 
+    def test_two_models_are_counted_not_joined(self):
+        # " + " read as one hyphenated model name: live 2026-09-13 the header
+        # said "Qwen3.8-27B-Cold-Fusion-GAIN-V1.1-NVFP4-GGUF + local", which
+        # names a model nobody is running.
+        own = self._lane(8890, model="tune")
+        peer = self._lane(8891, model="candidate")
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual(m["model"], "2 models")
+        self.assertEqual(m["models"], ["tune", "candidate"])
+
+    def test_one_model_across_both_lanes_keeps_its_name(self):
+        own = self._lane(8890, model="tune")
+        peer = self._lane(8891, model="tune")
+        m = stats.merge_snapshots(own, [peer])
+        self.assertEqual(m["model"], "tune")
+
     def test_models_join_and_days_sum_by_day(self):
         own = self._lane(8890, model="tune", days=[{"day": "2026-09-05", "prompt": 1, "cached": 2, "gen": 3}])
         peer = self._lane(8891, model="candidate", days=[{"day": "2026-09-05", "prompt": 10, "cached": 20, "gen": 30},
                                                          {"day": "2026-09-04", "prompt": 1, "cached": 1, "gen": 1}])
         m = stats.merge_snapshots(own, [peer])
-        self.assertEqual(m["model"], "tune + candidate")
+        self.assertEqual(m["model"], "2 models")
         # Newest first, as recent_days answers it: the usage page reads
         # days[0] as today and the first seven as the last week.
         self.assertEqual(m["days"], [{"day": "2026-09-05", "prompt": 11, "cached": 22, "gen": 33},

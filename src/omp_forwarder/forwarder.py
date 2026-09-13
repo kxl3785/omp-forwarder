@@ -1280,7 +1280,7 @@ def _load_latch() -> None:
     forwarder forgot the operator's stop and the container monitor reloaded
     the GPU within a minute. An unload -- and an assignment -- must outlive
     the process that performed it."""
-    global _operator_stopped, _preset, _saved_state
+    global _operator_stopped, _preset, _saved_state, _kv_plan
     path = _latch_path()
     if not path:
         return
@@ -1291,6 +1291,12 @@ def _load_latch() -> None:
         d = {}
     _operator_stopped = bool(d.get("operator_stopped"))
     _preset = d.get("preset") or None
+    # The window the last launch chose, so a lane that re-adopts a running
+    # container also re-adopts what it told that engine. The engine sized its
+    # cache once and publishes nothing about it, so a forwarder restart would
+    # otherwise leave the Lanes panel with no window beside a lane plainly
+    # serving one.
+    _kv_plan = dict(d.get("kv_plan") or {})
     _saved_state = dict(d)
 
 
@@ -1306,7 +1312,8 @@ def _save_latch() -> None:
                        "preset": _preset,
                        "upstream_port": FORCED_UPSTREAM,
                        "distro": WSL_DISTRO,
-                       "container": CONTAINER_NAME}, fh)
+                       "container": CONTAINER_NAME,
+                       "kv_plan": _kv_plan}, fh)
         os.replace(tmp, path)
     except OSError as exc:
         log(f"cannot write {path}: {exc!r}")

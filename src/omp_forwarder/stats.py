@@ -577,7 +577,15 @@ def merge_snapshots(own: dict, peers: list) -> dict:
         m = l.get("model")
         if m and m != "-" and m not in names:
             names.append(m)
-    out["model"] = " + ".join(names) if names else "-"
+    # One header line cannot name two models. Joining them with " + " read as
+    # a single hyphenated model -- live 2026-09-13, a Cold-Fusion GGUF on one
+    # card and NInfer's "local" on the other rendered as
+    # "Qwen3.8-27B-Cold-Fusion-GAIN-V1.1-NVFP4-GGUF + local", which names a
+    # model nobody is running. A count is true, and the names ride alongside
+    # for the page to show on the lane rows and behind the header's tooltip.
+    out["models"] = names
+    out["model"] = (names[0] if len(names) == 1
+                    else f"{len(names)} models" if names else "-")
     days: dict = {}
     for l in lanes:
         for d in l.get("days") or []:
@@ -1326,7 +1334,11 @@ async function tick(){
   // unless --studio-fallback was given: say which.
   $("up").textContent=nl>1?(s.fleet.serving+" of "+nl+" serving"):(s.upstream?("127.0.0.1:"+s.upstream):(s.studio_fallback?"Studio :8888 (fallback)":"none"));
   $("up").title = s.upstream_exe || "";
-  $("model").textContent=s.model; $("uptime").textContent=dur(s.uptime_s);
+  $("model").textContent=s.model;
+  // "2 models" is the honest header for a fleet running two. The names are
+  // one hover away, and the Lanes panel names each card outright.
+  $("model").title=((s.models||[]).length>1)?s.models.join(" · "):(s.model||"");
+  $("uptime").textContent=dur(s.uptime_s);
   $("dot").className="dot "+(s.healthy?"on":"off");
   $("state").textContent=s.healthy?"ready":(s.upstream?"unreachable":"no server");
 
@@ -1663,6 +1675,10 @@ async function tick(){
     const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"failed \u00b7 not running"))):"none assigned");
     const lp=row.querySelector(".lp"); lp.textContent=(l.preset||"\u2014")+" \u00b7 "+st;
     lp.className="lp "+(st==="serving"?"ok":(st==="loading\u2026"?"warn":(st==="unreachable"||st.startsWith("failed")?"bad":"dim")));
+    // The header can only count models when the lanes differ. This row is
+    // where "which card runs which" belongs, and the name is too long to set
+    // beside the preset without pushing the buttons off the row.
+    lp.title=(l.model&&l.model!=="-")?l.model:"";
     // The window this lane's launch chose. The title carries the arithmetic:
     // an operator who sees 131k where they expected 262k needs the free
     // memory and the budget to know whether to close something or to wait.

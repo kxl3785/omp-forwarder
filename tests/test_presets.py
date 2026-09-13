@@ -502,3 +502,35 @@ class GpuMemSettleTests(ForwarderCase):
         with mock.patch.object(fwd.time, "sleep"), \
                 mock.patch.object(fwd, "_run_host", return_value=None):
             self.assertIsNone(fwd._gpu_mem_settled(0))
+
+
+class KvPlanSurvivesRestartTests(ForwarderCase):
+    """The window outlives the forwarder, because the engine does."""
+
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(lambda: shutil.rmtree(self.tmp, ignore_errors=True))
+        fwd.TOKENS_FILE = os.path.join(self.tmp, "tokens.json")
+        fwd.LISTEN_PORT = 8891
+
+    def test_the_window_is_saved_and_adopted(self):
+        # A lane re-adopts a container that is still serving. It must also
+        # re-adopt what it told that engine: the engine sized its cache once
+        # and reports nothing about it, so the Lanes panel would otherwise
+        # show no window beside a lane plainly serving one.
+        fwd._preset = "eng"
+        fwd._kv_plan = {"tokens": 262144, "why": "largest rung this card affords"}
+        fwd._save_latch()
+        fwd._kv_plan, fwd._preset = {}, None
+        fwd._load_latch()
+        self.assertEqual(fwd._preset, "eng")
+        self.assertEqual(fwd._kv_plan["tokens"], 262144)
+
+    def test_a_latch_without_a_window_loads_empty(self):
+        fwd._preset = "eng"
+        fwd._kv_plan = {}
+        fwd._save_latch()
+        fwd._kv_plan = {"tokens": 1}
+        fwd._load_latch()
+        self.assertEqual(fwd._kv_plan, {})
