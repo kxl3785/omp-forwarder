@@ -580,6 +580,19 @@ class SharedHeaderTests(ForwarderCase):
             self.assertNotIn('id="peers"', page)
             self.assertNotIn("http://127.0.0.1:", page)
 
+    def test_the_lane_row_shows_the_kv_window(self):
+        # The same preset name means a 262k lane on an empty card and a 131k
+        # lane beside a desktop. Without this the operator cannot tell which
+        # one they have: no engine here reports its window over HTTP.
+        self.assertIn('class="lkv"', stats.PAGE)
+        self.assertIn("kv_plan", stats.PAGE)
+
+    def test_the_snapshot_carries_the_kv_window(self):
+        fwd._kv_plan = {"tokens": 131072, "free_mib": 26462,
+                        "why": "largest rung this card affords"}
+        s = stats.snapshot(fwd, fwd._stats)
+        self.assertEqual(s["kv_plan"]["tokens"], 131072)
+
 
 # ----------------------------------------------------------------
 # 8. Page markup: what a browser renders before any JavaScript runs

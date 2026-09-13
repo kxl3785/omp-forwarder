@@ -271,3 +271,147 @@ class SpawnFailedAssignTests(ForwarderCase):
                 mock.patch.object(fwd, "_spawn_host", return_value=mock.Mock()), \
                 mock.patch.object(fwd, "_git_bash", return_value=None):
             self.assertEqual(fwd._assign_preset("late"), ("loading", 49601))
+
+
+#: A container preset that carries measured costs, so the lane can size its
+#: KV window to the card instead of to a number written once. The figures are
+#: round for arithmetic, not real: the live ones live in presets.json.
+SIZED = {
+    "kind": "container", "port": "4960{gpu}", "distro": "Ubuntu-24.04",
+    "container": "eng{gpu}",
+    "run": "docker run -d --name {name} -p {port}:8080 img serve "
+           "--device {gpu} --max-context {kv} --kv-capacity {kv}",
+    "sizing": {"ladder": [262144, 196608, 131072], "weights_mib": 20000,
+               "workspace_mib": 500, "overhead_mib": 1000,
+               "kib_per_token": 35, "tenant_floor_mib": 0},
+}
+
+
+def _sized(**over) -> dict:
+    p = json.loads(json.dumps(SIZED))
+    p["sizing"].update(over)
+    return p
+
+
+class KvSizingTests(ForwarderCase):
+    """The KV window is chosen at launch, from what the card has free.
+
+    An engine that sizes its cache at load and never resizes has to be told
+    the right number on its command line, and the right number changes with
+    whatever else is resident. These tests pin the arithmetic and the ladder;
+    the engine's own refusal is covered by the step-down test."""
+
+    def setUp(self):
+        super().setUp()
+        fwd.FWD_GPU = 1
+        self.ran: list[list[str]] = []
+
+    def _launch(self, preset: dict, free: int, total: int = 32768,
+                settle="running"):
+        fwd._presets = {"eng": preset}
+        smi = _completed(f"{free}, {total}\n")
+        with mock.patch.object(fwd, "_run_host", return_value=smi), \
+                mock.patch.object(fwd, "_run_wsl",
+                                  side_effect=lambda a, timeout=10.0:
+                                  self.ran.append(a) or _completed()), \
+                mock.patch.object(fwd, "_spawn_wsl", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_await_container",
+                                  side_effect=(settle if isinstance(settle, list)
+                                               else None),
+                                  return_value=(None if isinstance(settle, list)
+                                                else settle)):
+            return fwd._assign_preset("eng")
+
+    def _run_line(self) -> str:
+        return [a for a in self.ran if "bash" in a and "-c" in a][-1][-1]
+
+    def test_an_empty_card_takes_the_top_rung(self):
+        # 32,000 free: 768 resident, no tenant floor, so the budget is
+        # 32000-20000-500-1000 = 10,500 MiB, or about 307k tokens at 35 KiB.
+        self._launch(_sized(), free=32000)
+        self.assertEqual(fwd._kv_plan["tokens"], 262144)
+        self.assertIn("--max-context 262144", self._run_line())
+        self.assertIn("--kv-capacity 262144", self._run_line())
+
+    def test_a_busy_card_takes_a_smaller_rung(self):
+        # 26,000 free leaves 4,500 MiB for the cache: 131k, not 262k.
+        self._launch(_sized(), free=26000)
+        self.assertEqual(fwd._kv_plan["tokens"], 131072)
+        self.assertIn("--max-context 131072", self._run_line())
+
+    def test_the_absent_tenant_keeps_its_floor(self):
+        # The same empty card, but another program needs 5 GiB to come back.
+        # Only the shortfall is held: 5000 - 768 resident = 4,232 MiB.
+        self._launch(_sized(tenant_floor_mib=5000), free=32000)
+        self.assertEqual(fwd._kv_plan["tokens"], 131072)
+        self.assertEqual(fwd._kv_plan["reserve_mib"], 4232)
+
+    def test_a_resident_tenant_is_not_reserved_twice(self):
+        # The tenant is already loaded, so its 6,768 MiB is missing from
+        # free. Holding its floor again would cost a rung for nothing.
+        self._launch(_sized(tenant_floor_mib=5000), free=26000)
+        self.assertEqual(fwd._kv_plan["reserve_mib"], 0)
+        self.assertEqual(fwd._kv_plan["others_mib"], 6768)
+
+    def test_no_rung_fits_so_the_smallest_is_attempted(self):
+        # 3,500 MiB of budget buys 102k tokens and the ladder stops at 131k.
+        # Launching anyway puts the engine's own refusal in its log, which is
+        # worth more than a lane that was never started.
+        self._launch(_sized(), free=25000)
+        self.assertEqual(fwd._kv_plan["tokens"], 131072)
+        self.assertIn("affords no rung", fwd._kv_plan["why"])
+
+    def test_an_unreadable_card_takes_the_smallest_window(self):
+        fwd._presets = {"eng": _sized()}
+        with mock.patch.object(fwd, "_run_host", return_value=None), \
+                mock.patch.object(fwd, "_run_wsl",
+                                  side_effect=lambda a, timeout=10.0:
+                                  self.ran.append(a) or _completed()), \
+                mock.patch.object(fwd, "_spawn_wsl", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_await_container", return_value="running"):
+            fwd._assign_preset("eng")
+        self.assertEqual(fwd._kv_plan["tokens"], 131072)
+        self.assertIsNone(fwd._kv_plan["free_mib"])
+
+    def test_a_refused_window_steps_down_one_rung(self):
+        # The estimate can overshoot: the engine knows its own reservation
+        # and this does not. A refusal must cost a rung, not the lane.
+        self._launch(_sized(), free=32000, settle=["exited", "running"])
+        self.assertEqual(fwd._kv_plan["tokens"], 196608)
+        self.assertIn("stepped down", fwd._kv_plan["why"])
+        self.assertIn("--max-context 196608", self._run_line())
+
+    def test_it_stops_after_two_step_downs(self):
+        self._launch(_sized(), free=32000,
+                     settle=["exited", "exited", "exited"])
+        self.assertEqual(fwd._kv_plan["tokens"], 131072)
+        runs = [a for a in self.ran if "bash" in a and "-c" in a]
+        self.assertEqual(len(runs), 3)
+
+    def test_a_preset_without_sizing_is_launched_unchanged(self):
+        fwd._presets = {"eng": {k: v for k, v in SIZED.items() if k != "sizing"}}
+        with mock.patch.object(fwd, "_run_host", return_value=_completed()), \
+                mock.patch.object(fwd, "_spawn_wsl", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_run_wsl",
+                                  side_effect=lambda a, timeout=10.0:
+                                  self.ran.append(a) or _completed()):
+            fwd._assign_preset("eng")
+        self.assertEqual(fwd._kv_plan, {})
+        self.assertIn("{kv}", self._run_line())
+
+    def test_a_process_preset_clears_a_stale_window(self):
+        fwd._kv_plan = {"tokens": 262144}
+        fwd._presets = {"proc": {"kind": "process", "port": "4950{gpu}",
+                                 "cmd": "bash launch.sh {gpu} {port}"}}
+        with mock.patch.object(fwd, "_spawn_host", return_value=mock.Mock()), \
+                mock.patch.object(fwd, "_run_host", return_value=_completed()):
+            fwd._assign_preset("proc")
+        self.assertEqual(fwd._kv_plan, {})
+
+    def test_await_container_returns_as_soon_as_it_exits(self):
+        # The refusal lands about six seconds in. Waiting out the grace
+        # would add six seconds to every failed button press.
+        with mock.patch.object(fwd.time, "sleep"), \
+                mock.patch.object(fwd, "_run_wsl",
+                                  return_value=_completed("false\n")):
+            self.assertEqual(fwd._await_container("D", "c"), "exited")

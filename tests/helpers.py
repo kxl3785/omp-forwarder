@@ -118,6 +118,9 @@ def reset_state() -> None:
     # test's log fixture would be treated as already counted.
     fwd._ninfer_counted = {}
     fwd._ninfer_log_seen = None
+    # The KV window the last preset launch chose. Left set, the next test's
+    # Lanes panel would carry another test's window.
+    fwd._kv_plan = {}
     # The /__control auth token, generated in main().
     fwd._control_token = ""
     # Lane identity: --name and --peer flags.

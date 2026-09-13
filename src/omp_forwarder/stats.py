@@ -760,6 +760,12 @@ def snapshot(fwd, stats: dict) -> dict:
         # the page shows the wait instead of a red light that looks broken.
         "presets": sorted(getattr(fwd, "_presets", {}) or {}),
         "preset": getattr(fwd, "_preset", None),
+        # The KV window this lane's launch chose, with the free memory and
+        # the budget it was chosen from. An engine that sizes its cache at
+        # load publishes nothing about it afterwards, so the launcher is the
+        # only witness -- and the operator needs to see which window a card
+        # got, because it changes with whatever else is resident.
+        "kv_plan": dict(getattr(fwd, "_kv_plan", {}) or {}),
         "loading": bool(getattr(fwd, "_preset", None)
                         and not getattr(fwd, "_upstream_healthy", False)
                         and not getattr(fwd, "_operator_stopped", False)
@@ -909,9 +915,16 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .ftab .pill{padding:1px 6px;border-radius:8px;font-size:11px}
 .recent .rk{color:var(--dim);font-size:10px;letter-spacing:.08em;
   text-transform:uppercase;margin-bottom:6px}
-.lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1fr) auto minmax(80px,auto);
+.lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1fr) minmax(112px,auto) auto minmax(80px,auto);
   gap:14px;align-items:center;padding:10px 14px;background:var(--panel);border:1px solid var(--line);
   border-radius:8px;font-family:var(--mono);font-size:12px}
+/* The KV window a launch chose. It belongs on the lane row and nowhere else:
+   it is per card, it changes between restarts as the card's other tenants
+   come and go, and no engine here reports it over HTTP. Without it the same
+   preset name means a 262k lane on an empty card and a 131k lane beside a
+   desktop, and the operator has no way to tell which one they are using. */
+.lane .lkv{color:var(--dim)}
+.lane .lkv b{color:var(--ink);font-weight:600}
 .lane .ln b{color:var(--ink);font-weight:600}
 .lane .ln a{color:var(--teal);text-decoration:none}
 .lane .ln a:hover{text-decoration:underline}
@@ -1624,7 +1637,8 @@ async function tick(){
   // so a click never lands on a freshly re-rendered button.
   const lanesEl=$("lanes");
   const me={port:String(location.port||"80"),name:s.name,gpu:s.gpu,preset:s.preset,loading:s.loading,
-    operator_stopped:s.operator_stopped,healthy:s.healthy,model:s.model,presets:s.presets||[],reachable:true,self:true};
+    operator_stopped:s.operator_stopped,healthy:s.healthy,model:s.model,presets:s.presets||[],
+    kv_plan:s.kv_plan||{},reachable:true,self:true};
   const lanes=[me].concat((s.peers||[]).map(pp=>Object.assign({},pp,{port:String(pp.port)})));
   const lkey=lanes.map(l=>l.port+":"+(l.presets||[]).join(",")).join("|");
   if(lanesEl.dataset.built!==lkey){
@@ -1633,7 +1647,7 @@ async function tick(){
       const btns=(l.presets||[]).map(p=>'<button data-act="assign" data-preset="'+esc(p)+'"'+ln+'>'+esc(p)+'</button>').join("")
         +'<button data-act="stop" class="danger"'+ln+'>unload</button>';
       return '<div class="lane" data-port="'+esc(l.port)+'"><span class="ln"></span><span class="lg"></span>'
-        +'<span class="lp"></span><span class="ctl">'+btns+'</span><span class="ctl_msg"></span></div>';
+        +'<span class="lp"></span><span class="lkv"></span><span class="ctl">'+btns+'</span><span class="ctl_msg"></span></div>';
     }).join("");
     lanesEl.dataset.built=lkey; wireCtl(lanesEl);
   }
@@ -1649,6 +1663,19 @@ async function tick(){
     const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"failed \u00b7 not running"))):"none assigned");
     const lp=row.querySelector(".lp"); lp.textContent=(l.preset||"\u2014")+" \u00b7 "+st;
     lp.className="lp "+(st==="serving"?"ok":(st==="loading\u2026"?"warn":(st==="unreachable"||st.startsWith("failed")?"bad":"dim")));
+    // The window this lane's launch chose. The title carries the arithmetic:
+    // an operator who sees 131k where they expected 262k needs the free
+    // memory and the budget to know whether to close something or to wait.
+    const kvEl=row.querySelector(".lkv"), kp=l.kv_plan||{};
+    if(kp.tokens){
+      kvEl.innerHTML="KV <b>"+fmt(kp.tokens)+"</b>";
+      const bits=[kp.why||""];
+      if(kp.free_mib!==null&&kp.free_mib!==undefined) bits.push(fmt(kp.free_mib)+" MiB free at launch");
+      if(kp.reserve_mib) bits.push(fmt(kp.reserve_mib)+" MiB held back for other tenants");
+      if(kp.affordable) bits.push("affords "+fmt(kp.affordable)+" tokens");
+      if((kp.ladder||[]).length) bits.push("ladder "+kp.ladder.map(fmt).join(" / "));
+      kvEl.title=bits.filter(Boolean).join(" \u00b7 ");
+    } else { kvEl.textContent=""; kvEl.title=""; }
     row.querySelectorAll("button").forEach(b=>{
       b.disabled=!!l.loading||!l.reachable;
       if(b.dataset.act==="assign") b.classList.toggle("on", b.dataset.preset===l.preset && !l.operator_stopped && !!l.healthy);

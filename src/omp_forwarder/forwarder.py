@@ -102,12 +102,17 @@ _upstream_child: subprocess.Popen | None = None
 #: tokens.json). A preset is {"kind": "process"|"container", "port": int or
 #: a "{gpu}" template, and for process "cmd", for container "distro",
 #: "container" (name template) and "run" (a docker run line)}. Templates
-#: take {gpu}, {port} and {name}. Reserved for launch recipes that have been
-#: measured; the seed file holds the two that won on 2026-09-05.
+#: take {gpu}, {port}, {name} and {kv}. Reserved for launch recipes that have
+#: been measured; the seed file holds the two that won on 2026-09-05.
 PRESETS_FILE: str | None = None
 _presets: dict = {}
 #: The preset this lane currently fronts, or None. Persisted with the latch.
 _preset: str | None = None
+#: What the last preset launch chose for its KV window, and the arithmetic
+#: behind it. An engine that sizes its cache at load and publishes nothing
+#: over HTTP cannot be asked afterwards, so the lane that launched it is the
+#: only place this is known. Empty when the preset carries no "sizing" block.
+_kv_plan: dict = {}
 #: The container monitor thread runs at most once per process. A lane that
 #: starts without --container and later assigns a container preset needs it
 #: started on demand, or the dashboard reads "unknown" for a running container.
@@ -666,6 +671,10 @@ def _sample_peers() -> None:
                 "operator_stopped": bool(d.get("operator_stopped")),
                 "presets": list(d.get("presets") or []),
                 "model": d.get("model") or "",
+                # The KV window the peer's launch chose, and the arithmetic
+                # behind it. A window is a launch decision no engine reports
+                # over HTTP, so it reaches the page only this way.
+                "kv_plan": d.get("kv_plan") or {},
                 # The port the peer fronts, so this lane never takes it.
                 "upstream": d.get("upstream"),
             }
@@ -1329,18 +1338,127 @@ def _load_presets() -> None:
         _presets = {}
 
 
-def _render(template, gpu: int, port: int | None = None, name: str = "") -> str:
-    """Fill {gpu}, {port} and {name} in a preset template. str.replace, not
-    str.format: a docker run line carries JSON braces of its own."""
+def _render(template, gpu: int, port: int | None = None, name: str = "",
+            kv: int | None = None) -> str:
+    """Fill {gpu}, {port}, {name} and {kv} in a preset template. str.replace,
+    not str.format: a docker run line carries JSON braces of its own."""
     s = str(template)
     s = s.replace("{gpu}", str(gpu))
     if port is not None:
         s = s.replace("{port}", str(port))
+    if kv is not None:
+        s = s.replace("{kv}", str(kv))
     return s.replace("{name}", name)
 
 
 def _preset_port(p: dict, gpu: int) -> int:
     return int(_render(p.get("port", 0), gpu))
+
+
+def _gpu_mem_mib(gpu: int) -> tuple[int, int] | None:
+    """(free, total) VRAM on one card, read fresh. None when nvidia-smi
+    cannot answer.
+
+    _gpu_state carries the same numbers, but the sampler refreshes it every
+    10 s and a preset launch has just unloaded the card. A ten-second-old
+    reading still counts the old model's 20 GiB as used, and the new lane
+    would be sized down to nothing on a card that is in fact empty."""
+    res = _run_host(["nvidia-smi", "--query-gpu=memory.free,memory.total",
+                     "--format=csv,noheader,nounits", "-i", str(gpu)],
+                    timeout=5)
+    if res is None or res.returncode != 0 or not res.stdout:
+        return None
+    try:
+        parts = res.stdout.strip().splitlines()[0].split(",")
+        return int(parts[0].strip()), int(parts[1].strip())
+    except (ValueError, IndexError):
+        return None
+
+
+def _plan_kv(p: dict, gpu: int) -> dict:
+    """Choose this launch's KV window from what the card has free right now.
+
+    An engine that sizes its cache once, at load, has to be told the right
+    number on the command line -- and the right number changes. The same
+    card carries the Windows desktop, another program's model, or nothing
+    at all. Measured 2026-09-13: two lanes refused to start, each about a
+    gigabyte short, because another tool had loaded twenty seconds earlier.
+
+    The preset carries the model's cost and a LADDER of windows; this picks
+    the largest rung the card can pay for. The ladder is the point. Sizing
+    to the exact free byte would advertise a different context on every
+    restart, and an agent that planned around 262k would silently get 131k.
+    A rung is a number an operator can reason about.
+
+    `tenant_floor_mib` is room the card's OTHER tenant needs. That tenant may
+    be down at launch: on this box a radiology tool and its 4B model restart
+    through the day, and a lane that took the whole empty card would leave
+    them unable to load. Only the SHORTFALL is held back -- whatever the
+    tenant already holds is missing from `free` anyway, and reserving it a
+    second time would cost a rung for nothing."""
+    sz = p.get("sizing") or {}
+    ladder = sorted({int(t) for t in (sz.get("ladder") or []) if int(t) > 0},
+                    reverse=True)
+    if not ladder:
+        return {}
+    mem = _gpu_mem_mib(gpu)
+    plan: dict = {"ladder": ladder,
+                  "free_mib": None if mem is None else mem[0],
+                  "tenant_floor_mib": int(sz.get("tenant_floor_mib", 0))}
+    if mem is None:
+        # No reading is not a licence to guess high. The smallest rung is
+        # the one most likely to start, and a lane that starts small beats
+        # a lane that refuses.
+        plan["tokens"] = ladder[-1]
+        plan["why"] = "no nvidia-smi reading; smallest window"
+        return plan
+    free, total = mem
+    # Everything already resident that is not this lane: the desktop, the
+    # other tenant, another card's leftovers. The lane was unloaded before
+    # this ran, so none of it is ours.
+    others = max(0, total - free)
+    reserve = max(0, plan["tenant_floor_mib"] - others)
+    per_tok_kib = float(sz.get("kib_per_token", 0)) or 1.0
+    fixed = (int(sz.get("weights_mib", 0)) + int(sz.get("workspace_mib", 0))
+             + int(sz.get("overhead_mib", 0)) + reserve)
+    budget = free - fixed
+    afford = int(budget * 1024 / per_tok_kib) if budget > 0 else 0
+    plan["others_mib"] = others
+    plan["reserve_mib"] = reserve
+    plan["budget_mib"] = budget
+    plan["affordable"] = afford
+    for t in ladder:
+        if t <= afford:
+            plan["tokens"] = t
+            plan["why"] = "largest rung this card affords"
+            return plan
+    # Nothing fits. Launch the smallest anyway and let the engine say so in
+    # its own words: a refusal with a byte count in the log is worth more
+    # than a lane that was never started and has nothing to show.
+    plan["tokens"] = ladder[-1]
+    plan["why"] = "card affords no rung; smallest attempted"
+    return plan
+
+
+def _await_container(distro: str, cname: str, grace: float = 12.0) -> str:
+    """Wait just long enough to see a sizing refusal. "exited" or "running".
+
+    NInfer loads its weights, sizes its cache, then either listens or exits.
+    Measured 2026-09-13: the refusal lands about six seconds after docker
+    run and the listen about twelve. Catching the refusal is the whole
+    reason this wait exists, so poll for it and return the moment the
+    container is gone rather than waiting out the grace."""
+    end = time.time() + grace
+    while time.time() < end:
+        time.sleep(1.0)
+        res = _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--", "docker",
+                        "inspect", "-f", "{{.State.Running}}", cname],
+                       timeout=15)
+        if res is None:
+            continue
+        if "false" in (res.stdout or "").lower():
+            return "exited"
+    return "running"
 
 
 def _preset_log(p: dict, gpu: int, port: int | None = None) -> str | None:
@@ -1389,6 +1507,7 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     the other, the reverse, or the same recipe on both."""
     global FORCED_UPSTREAM, _upstream, _upstream_kind, _upstream_exe, _upstream_healthy, UPSTREAM_LOG
     global WSL_DISTRO, CONTAINER_NAME, _operator_stopped, _preset, _upstream_child
+    global _kv_plan
     if FWD_GPU is None:
         return "no-gpu", None
     # Re-read the file on every assign: a recipe edited or added after the
@@ -1405,18 +1524,41 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     port = _preset_port(p, gpu)
     _unload_current()
     if p["kind"] == "process":
+        # A process preset carries no sizing: nothing here chose its window.
+        _kv_plan = {}
         _upstream_child = _spawn_host(_host_argv(_render(p["cmd"], gpu, port)))
         if _upstream_child is None:
             return "spawn-failed", port
     else:
         cname = _render(p.get("container", "lane{gpu}"), gpu, port)
         distro = p["distro"]
-        run = _render(p["run"], gpu, port, cname)
-        # A stale container of the same name would make docker run fail.
-        _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--",
-                  "docker", "rm", "-f", cname], timeout=timeout)
-        _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--", "bash", "-c", run],
-                 timeout=timeout)
+        plan = _plan_kv(p, gpu)
+        # Rungs to try, largest first. Two step-downs and no more: a third
+        # attempt costs another twelve seconds on a button press, and if two
+        # rungs below the estimate still will not fit then the card is not
+        # short by a rounding error and the operator needs to see that.
+        rungs: list[int | None] = [None]
+        if plan.get("tokens"):
+            below = [t for t in plan["ladder"] if t < plan["tokens"]]
+            rungs = [plan["tokens"]] + below[:2]
+        for attempt, kv in enumerate(rungs):
+            run = _render(p["run"], gpu, port, cname, kv)
+            # A stale container of the same name would make docker run fail.
+            _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--",
+                      "docker", "rm", "-f", cname], timeout=timeout)
+            _run_wsl(["wsl.exe", "-d", distro, "-u", "root", "--", "bash", "-c", run],
+                     timeout=timeout)
+            if kv is None:
+                break                      # unsized preset: the old behaviour
+            # Record what was actually launched, every attempt. The page must
+            # name the window the engine was given, not the one first chosen.
+            plan["tokens"] = kv
+            if attempt:
+                plan["why"] = "stepped down: the engine refused a larger window"
+            if _await_container(distro, cname) != "exited":
+                break
+            log(f"preset {name} refused a {kv}-token window on gpu {gpu}")
+        _kv_plan = plan
         WSL_DISTRO, CONTAINER_NAME = distro, cname
         _container_keepalive_start()
         # Show a status at once and keep it live: a lane that started as a
