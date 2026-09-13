@@ -217,4 +217,29 @@ lazily imported so `--tray` degrades to headless rather than failing.
 
 **A lane owns one GPU, and discovery respects that.** With two lanes and `--upstream-exe` matching both cards' llama-servers, the GPU 0 lane with nothing assigned discovered the server the GPU 1 lane had just loaded: highest healthy port wins. Its traffic would have crossed cards and its header `stop` would have killed the other card's model. `_taken_ports` now removes from discovery every port a peer fronts (from the peer snapshot's `upstream`) and every preset port that maps to another GPU. Studio's own server on 49500 therefore belongs to the GPU 0 lane by the `4950{gpu}` convention.
 
+**A container preset must publish on 0.0.0.0, never on WSL's loopback.** The
+forwarder runs on Windows and the container runs in the WSL distro, and WSL2
+forwards a published port to Windows localhost only when it is bound to
+`0.0.0.0`. Measured 2026-09-12: `-p 127.0.0.1:28080:8080` answered `/health`
+from inside WSL and was refused from Windows, which looks exactly like a dead
+upstream. Write `-p {port}:8080`, as the SGLang preset does.
+
+**A container also dies when the last `wsl.exe` client exits** — the same
+WSL2 shutdown that `--container` mode holds off with its `sleep infinity`
+child. Anything that starts a preset container outside the forwarder needs
+its own keepalive, or the model unloads a minute later with exit code 0 and
+no error anywhere.
+
+**Preset notes carry the measurement, not just the command.** The 2026-09-12
+campaign added `ninfer-nvfp4` and `ninfer-coldfusion` (NInfer, one engine per
+card, port `4960{gpu}` because `llama-tune` owns `4950{gpu}`). Their notes
+record what was measured: the NVFP4 lane's KV pool holds 232,768 tokens, so
+two 80k conversations fit and a third evicts both; the Cold-Fusion lane is for
+thinking-on work, where it finished the suite in 194 s against 287 s for the
+official weights. Tensor parallelism across the two cards is NOT a preset and
+must not become one: these GeForce cards grant no peer access, the collectives
+stage through host memory at 29.5-51.6 us per exchange with 128 exchanges per
+token, and `--tp 2` measured about half the speed of one card while losing
+prefix reuse entirely.
+
 **The default `/__stats.json` is the fleet; `?self=1` is the lane.** `merge_snapshots` sums cumulative counters BEFORE the page differences them, which is what makes the page's rate logic produce fleet rates unchanged. Per-stream ids become `<port>:<slot>` because the page keys its rate history by id. Peers are read on the page's poll, but only the ones the sampler last saw reachable (a dead port costs 2 s here), and always with `?self=1`, or two lanes fold each other in without end. The peer's `control_token` is dropped before the merge.
