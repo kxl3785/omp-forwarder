@@ -184,6 +184,14 @@ PREFER: str = "llama-server"
 #: (the request path) only copies them. Shape: {engine, thinking,
 #: speculative, parallel, model_path}.
 _upstream_facts: dict = {}
+
+#: Path to an NInfer request log (--request-log-jsonl), or None. NInfer
+#: publishes nothing over HTTP -- no /metrics, no /slots, no /props -- so this
+#: file is the only way the dashboard can show such a lane in flight. Set by
+#: --upstream-log, or by a preset carrying a "log" key.
+UPSTREAM_LOG: str | None = None
+#: What the sampler last read out of that log. The request path only copies it.
+_ninfer_stats: dict = {}
 #: One random 32-hex string, generated at startup. The /__control endpoint
 #: requires it in the query string before it will mutate the container. The
 #: dashboard is loopback-only, but any web page the user visits can make the
@@ -551,6 +559,49 @@ def _sample_health() -> None:
     _upstream_healthy = _healthy(port)
 
 
+def _sample_ninfer_log() -> None:
+    """Read an NInfer lane's own request log, off the request path.
+
+    Runs on the sampler thread beside the other probes. A missing file, or a
+    log whose newest throughput record has gone stale, leaves the dashboard
+    showing nothing rather than a number that was true a minute ago."""
+    global _ninfer_stats
+    from . import stats as stats_mod
+    path = UPSTREAM_LOG
+    if not path and _preset and FWD_GPU is not None:
+        # A forwarder that restarted and adopted a latched preset never ran
+        # the assign that sets the path, so derive it from the recipe.
+        path = _preset_log(_presets.get(_preset) or {}, int(FWD_GPU))
+    if not path:
+        _ninfer_stats = {}
+        return
+    _ninfer_stats = stats_mod.ninfer_log_stats(path, reader=_wsl_tail_reader())
+
+
+def _wsl_tail_reader():
+    """Read the tail of a file inside the distro, or None for a plain path.
+
+    A path that starts with a drive letter is a Windows file and opens
+    normally. Anything else lives in the distro the engine runs in, and only
+    `wsl.exe` can read it: Python cannot open the \\\\wsl$ share from this
+    process."""
+    if not WSL_DISTRO:
+        return None
+
+    def read(path: str, nbytes: int):
+        # The newest boot record first, then the tail. The Deployment panel's
+        # facts live in `server_start`, which a busy lane pushes out of the
+        # tail within minutes; `tac | grep -m1` finds the current one whatever
+        # the file size, and a newer copy inside the tail still wins.
+        script = ("tac %s 2>/dev/null | grep -m1 -a server_start; "
+                  "tail -c %d %s 2>/dev/null") % (path, nbytes, path)
+        r = _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
+                      "sh", "-c", script], timeout=8.0)
+        return (r.stdout or "") if r is not None and r.returncode == 0 else ""
+
+    return read
+
+
 def _sample_upstream_facts() -> None:
     """Read the deployment facts (engine, thinking, speculative, parallel,
     model_path) from the upstream and remember them in _upstream_facts.
@@ -679,6 +730,7 @@ def _upstream_sampler() -> None:
         _sample_health()
         _sample_model()
         _sample_upstream_facts()
+        _sample_ninfer_log()
         _sample_peers()
         _sample_gpus()
         # The owner PID of a process upstream, so the Upstream-process bit
@@ -1223,10 +1275,22 @@ def _preset_port(p: dict, gpu: int) -> int:
     return int(_render(p.get("port", 0), gpu))
 
 
+def _preset_log(p: dict, gpu: int, port: int | None = None) -> str | None:
+    """The request log a preset names, with {gpu}/{port}/{name} filled, or
+    None. {name} is the container name, because that is what the preset's own
+    run line passes to --request-log-jsonl."""
+    if not p.get("log"):
+        return None
+    cname = _render(p.get("container", ""), gpu)
+    return _render(p["log"], gpu, port if port is not None else _preset_port(p, gpu),
+                   cname)
+
+
 def _unload_current(timeout: float = 30.0) -> None:
     """Stop whatever this lane fronts, container or process, and drop the
     container-mode globals so the next assignment starts clean."""
-    global WSL_DISTRO, CONTAINER_NAME, _container_status
+    global WSL_DISTRO, CONTAINER_NAME, _container_status, UPSTREAM_LOG
+    UPSTREAM_LOG = None
     if WSL_DISTRO and CONTAINER_NAME:
         _run_wsl(["wsl.exe", "-d", WSL_DISTRO, "-u", "root", "--",
                   "docker", "stop", CONTAINER_NAME], timeout=timeout)
@@ -1255,7 +1319,7 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
     The lane's GPU comes from --gpu; a preset never chooses a card. Two
     lanes therefore give every arrangement: tune on one card and SGLang on
     the other, the reverse, or the same recipe on both."""
-    global FORCED_UPSTREAM, _upstream, _upstream_kind, _upstream_exe, _upstream_healthy
+    global FORCED_UPSTREAM, _upstream, _upstream_kind, _upstream_exe, _upstream_healthy, UPSTREAM_LOG
     global WSL_DISTRO, CONTAINER_NAME, _operator_stopped, _preset, _upstream_child
     if FWD_GPU is None:
         return "no-gpu", None
@@ -1300,6 +1364,9 @@ def _assign_preset(name: str, timeout: float = 60.0) -> tuple[str, int | None]:
         # nothing, the page read "loading" through a served completion, and
         # stop found no PID to kill because the lookup keys on _upstream.
         FORCED_UPSTREAM = port
+        # A preset may name the request log its engine writes. That is the
+        # only live source for an engine that publishes no HTTP metrics.
+        UPSTREAM_LOG = _preset_log(p, gpu, port)
         _upstream, _upstream_kind, _upstream_exe = port, "explicit", None
         _upstream_healthy = False
         _stats["model"] = ""
@@ -1852,6 +1919,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                    help="JSON file of model presets the dashboard can assign "
                         "to this lane's GPU (default: presets.json beside the "
                         "tokens file). See README.")
+    p.add_argument("--upstream-log", default=None, metavar="FILE",
+                   help="an NInfer --request-log-jsonl file to read this "
+                        "lane's live state from; that engine publishes no "
+                        "HTTP metrics")
     p.add_argument("--upstream-cmd", default=None, metavar="COMMAND",
                    help="command that starts this lane's model server when "
                         "it is a plain process (not a container). Enables "
@@ -1886,6 +1957,7 @@ def main(argv: list[str] | None = None) -> int:
     global LISTEN_PORT, STUDIO_PORT, FORCED_UPSTREAM, EXCLUDE_PORTS
     global TOKENS_FILE, _last_day, WAIT_FOR_MODEL, STUDIO_FALLBACK
     global UPSTREAM_EXE, WSL_DISTRO, CONTAINER_NAME, UPSTREAM_CMD, PRESETS_FILE
+    global UPSTREAM_LOG
     global CANDIDATE_PORTS, PREFER
     global _container_status, _container_last_start
     global FWD_NAME, PEERS, FWD_GPU, _control_token
@@ -1905,6 +1977,7 @@ def main(argv: list[str] | None = None) -> int:
     FWD_NAME = args.name
     FWD_GPU = args.gpu
     UPSTREAM_CMD = args.upstream_cmd
+    UPSTREAM_LOG = args.upstream_log
     PRESETS_FILE = args.presets
     PEERS = list(args.peer)
     # A new process: any peer/GPU state is stale and must not survive.

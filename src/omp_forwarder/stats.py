@@ -252,6 +252,157 @@ def upstream_model(port: int | None) -> str:
 
 
 
+# --- NInfer: the engine publishes NOTHING over HTTP ------------------------
+# No /metrics, no /slots, no /props. Its live state goes to the JSONL file
+# named by --request-log-jsonl, and that file is the only way this dashboard
+# can show an NInfer lane in flight. A `throughput` record lands every
+# --log-stats-interval-ms with the scheduler's occupancy and the interval's
+# rates; a `request_done` record lands per request with its phase seconds,
+# cached prompt tokens and speculative counters.
+#
+# The read is a bounded tail, on the sampler thread, never on the request
+# path. A log that does not exist, or has no recent throughput record, yields
+# {} and the lane shows what it showed before: nothing invented.
+NINFER_TAIL_BYTES = 256 * 1024
+NINFER_STALE_S = 30.0
+
+
+def _ninfer_tail(path: str, tail_bytes: int, reader=None) -> list:
+    """The last whole JSON lines of the log, oldest first.
+
+    `reader(path, tail_bytes) -> bytes` exists because the log usually lives
+    inside the WSL distro that runs the engine, and Windows cannot open
+    `\\\\wsl$\\...` from every process: measured 2026-09-13, PowerShell listed
+    the share while Python got WinError 3 on the same path. The forwarder
+    therefore passes a reader that shells into the distro, exactly as
+    container mode already does for docker."""
+    if reader is not None:
+        blob = reader(path, tail_bytes)
+        if not blob:
+            return []
+        if isinstance(blob, str):
+            blob = blob.encode("utf-8", "replace")
+    else:
+        import os
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                if size > tail_bytes:
+                    f.seek(size - tail_bytes)
+                    f.readline()      # drop the partial first line
+                blob = f.read()
+        except Exception:
+            return []
+    out = []
+    for raw in blob.split(b"\n"):
+        if not raw.strip():
+            continue
+        try:
+            out.append(json.loads(raw.decode("utf-8", "replace")))
+        except Exception:
+            continue
+    return out
+
+
+def ninfer_log_stats(path: str | None, now: float | None = None,
+                     tail_bytes: int = NINFER_TAIL_BYTES, reader=None) -> dict:
+    """What an NInfer lane is doing, read from its own request log."""
+    if not path:
+        return {}
+    events = _ninfer_tail(path, tail_bytes, reader)
+    if not events:
+        return {}
+    now = time.time() if now is None else now
+
+    start = None
+    tput = None
+    done = []
+    for ev in events:
+        kind = ev.get("event")
+        if kind == "server_start":
+            start = ev
+        elif kind == "throughput":
+            tput = ev
+        elif kind == "request_done":
+            done.append(ev)
+
+    out: dict = {}
+
+    # --- deployment facts, from the boot record ---
+    if start:
+        eng = start.get("engine") or {}
+        srv = start.get("server") or {}
+        art = start.get("artifact") or {}
+        backend = eng.get("speculative_backend") or ""
+        window = eng.get("speculative_draft_window") or ""
+        spec_text = ("%s %s" % (backend, window)).strip() if backend else "none"
+        think = srv.get("default_thinking")
+        out["facts"] = {
+            "engine": "ninfer",
+            "thinking": "on" if think is True else ("off" if think is False
+                                                    else "unknown"),
+            "speculative": spec_text,
+            "parallel": "tp=%d" % (eng.get("tp") or len(eng.get("devices") or []) or 1),
+            "model_path": art.get("path") or art.get("target") or "",
+        }
+        # The per-sequence ceiling, which is what the lane row's context
+        # column means. The KV pool is the other limit and is reported apart:
+        # it is shared by every request and every retained prefix.
+        out["ctx"] = eng.get("max_context") or eng.get("effective_max_context") or 0
+        out["kv_capacity"] = eng.get("kv_capacity") or 0
+
+    # --- in flight, from the newest throughput record ---
+    if tput:
+        age = max(0.0, now - (tput.get("timestamp_unix_ms", 0) / 1000.0))
+        sch = tput.get("scheduler") or {}
+        rates = tput.get("throughput_tokens_per_second") or {}
+        fresh = age <= NINFER_STALE_S
+        out["scheduler"] = {
+            "running": sch.get("running", 0) if fresh else 0,
+            "prefilling": sch.get("prefilling", 0) if fresh else 0,
+            "waiting": sch.get("waiting", 0) if fresh else 0,
+            "age_s": round(age, 1),
+        }
+        out["rates"] = {
+            "decode": rates.get("decode", 0.0) if fresh else 0.0,
+            "prefill": rates.get("prefill", 0.0) if fresh else 0.0,
+        }
+
+    # --- finished requests: the RECENT list and the cache evidence ---
+    recent = []
+    prompt = cached = completion = 0
+    drafted = accepted = 0
+    for ev in done[-40:]:
+        res = ev.get("result") or {}
+        tim = ev.get("timings_seconds") or {}
+        spec = ev.get("speculative") or {}
+        prompt += res.get("prompt_tokens", 0)
+        cached += res.get("prefix_cache_hit_tokens", 0)
+        completion += res.get("completion_tokens", 0)
+        drafted += spec.get("drafted_tokens", 0)
+        accepted += spec.get("accepted_tokens", 0)
+        n = res.get("completion_tokens", 0)
+        dec = tim.get("decode") or 0.0
+        recent.append({
+            "slot": "req %s" % ((ev.get("request") or {}).get("request_id", "?")),
+            "tokens": n,
+            "seconds": round(dec, 1) if dec > 0 else None,
+            "rate": round((n - 1) / dec, 1) if (dec > 0 and n > 1) else None,
+            "prompt": res.get("prompt_tokens", 0),
+            "cached": res.get("prefix_cache_hit_tokens", 0),
+            "ended": (ev.get("timestamp_unix_ms", 0) / 1000.0) or now,
+        })
+    if recent:
+        out["recent"] = list(reversed(recent))[:12]
+        out["totals"] = {
+            "prompt": prompt, "cached": cached, "completion": completion,
+            "drafted": drafted, "accepted": accepted,
+            "cache_hit_rate": (cached / prompt) if prompt else 0.0,
+            "acceptance": (accepted / drafted) if drafted else 0.0,
+        }
+    return out
+
+
 def _http_get_json(port: int | None, path: str,
                    timeout: int = 4) -> dict | None:
     """GET a JSON endpoint on the upstream, or None on any failure. This is
@@ -384,6 +535,18 @@ def merge_snapshots(own: dict, peers: list) -> dict:
     for l in lanes:
         rows.extend(l.get("lane_rows") or [])
     out["lane_rows"] = rows
+    # The NInfer blocks carry raw quantities on purpose, so the fleet is the
+    # sum and the page does the dividing. Windows and pools take the largest.
+    nins = [l.get("ninfer") for l in lanes if l.get("ninfer")]
+    if nins:
+        merged = {}
+        for k in ("running", "waiting", "decode", "prefill", "prompt",
+                  "cached", "drafted", "accepted"):
+            merged[k] = sum(n.get(k, 0) or 0 for n in nins)
+        for k in ("ctx", "kv_capacity", "max_prompt"):
+            merged[k] = max((n.get(k, 0) or 0) for n in nins)
+        merged["lanes"] = len(nins)
+        out["ninfer"] = merged
     facts = []
     for l in lanes:
         facts.extend(l.get("lane_facts") or [])
@@ -473,6 +636,45 @@ def snapshot(fwd, stats: dict) -> dict:
             "ctx": g("sglang:context_len", 0.0),
             "kv": g("sglang:token_usage", 0.0),
         })
+    # An NInfer lane has no /slots and no /metrics, so its row and its
+    # recent list come from the log the sampler read. Never call this row a
+    # stream: it is what the engine says about the whole lane.
+    nin = getattr(fwd, "_ninfer_stats", {}) or {}
+    if nin:
+        sch = nin.get("scheduler") or {}
+        rates = nin.get("rates") or {}
+        tot = nin.get("totals") or {}
+        lane_rows.append({
+            "lane": getattr(fwd, "LISTEN_PORT", None),
+            "engine": "ninfer",
+            "running": sch.get("running", 0),
+            "queued": sch.get("waiting", 0),
+            "rate": rates.get("decode", 0.0),
+            "cached": tot.get("cache_hit_rate", 0.0),
+            "ctx": nin.get("ctx", 0),
+            "kv": 0.0,
+        })
+    ninfer_block = None
+    if nin:
+        sch = nin.get("scheduler") or {}
+        rates = nin.get("rates") or {}
+        tot = nin.get("totals") or {}
+        rec = nin.get("recent") or []
+        # Raw quantities, never ratios: the fleet merge adds these up and the
+        # page divides. A merged average of two averages would be wrong.
+        ninfer_block = {
+            "running": sch.get("running", 0),
+            "waiting": sch.get("waiting", 0),
+            "decode": rates.get("decode", 0.0),
+            "prefill": rates.get("prefill", 0.0),
+            "prompt": tot.get("prompt", 0),
+            "cached": tot.get("cached", 0),
+            "drafted": tot.get("drafted", 0),
+            "accepted": tot.get("accepted", 0),
+            "ctx": nin.get("ctx", 0),
+            "kv_capacity": nin.get("kv_capacity", 0),
+            "max_prompt": max((r.get("prompt", 0) for r in rec), default=0),
+        }
     ensure_stream_watcher(fwd)
     _ka = getattr(fwd, "_container_keepalive", None)
     keepalive_pid = _ka.pid if _ka is not None else None
@@ -507,7 +709,7 @@ def snapshot(fwd, stats: dict) -> dict:
         "metrics_available": bool(m),
         # The deployment facts the Deployment panel shows, refreshed by the
         # sampler thread; the request path only copies them.
-        "facts": getattr(fwd, "_upstream_facts", {}) or {},
+        "facts": (nin.get("facts") or getattr(fwd, "_upstream_facts", {}) or {}),
         # The keepalive child's pid when container mode is on, else null.
         "keepalive_pid": keepalive_pid,
         # --- lane identity: name this forwarder and link its peers ---
@@ -612,8 +814,13 @@ def snapshot(fwd, stats: dict) -> dict:
         # Per-stream, from /slots. /metrics cannot give this.
         "slots": slots,
         # Streams that finished, so the panel says something between bursts.
-        "recent_streams": recent_streams(getattr(fwd, "LISTEN_PORT", None)),
+        "recent_streams": ([dict(r, lane=getattr(fwd, "LISTEN_PORT", None))
+                            for r in nin["recent"]] if nin.get("recent")
+                           else recent_streams(getattr(fwd, "LISTEN_PORT", None))),
         "lane_rows": lane_rows,
+        # NInfer's live state, from its request log. None on any other
+        # engine, and the page falls back to /metrics as before.
+        "ninfer": ninfer_block,
         # This lane's deployment facts as one row, so the panel can show
         # every card at once instead of only the page you happen to open.
         "lane_facts": [{
@@ -623,7 +830,7 @@ def snapshot(fwd, stats: dict) -> dict:
             "upstream": port,
             "upstream_kind": getattr(fwd, "_upstream_kind", None),
             "keepalive_pid": keepalive_pid,
-            "facts": getattr(fwd, "_upstream_facts", {}) or {},
+            "facts": (nin.get("facts") or getattr(fwd, "_upstream_facts", {}) or {}),
         }],
     }
 
@@ -1112,7 +1319,31 @@ async function tick(){
 
   // --- model section: throughput, decode, prefill, draft ---
   const NP = "not provided by this engine";
-  if(engine==="sglang" && s.metrics_available){
+  // NInfer publishes no /metrics and no /slots. Its live state reaches the
+  // page through the engine's own request log, already as rates, so nothing
+  // here is differenced against the previous poll.
+  const NIN = s.ninfer || null;
+  if(NIN){
+    const many = (NIN.lanes||1)>1;
+    const where = many ? "live, all lanes" : "live, from the engine log";
+    const mix = renderSlots(s);
+    $("tput").textContent = fmt(mix.haveRate ? mix.total : NIN.decode);
+    $("tput_n").textContent = where;
+    $("dec").textContent = fmt(NIN.decode);
+    $("dec_n").textContent = where;
+    $("pre").textContent = fmt(NIN.prefill);
+    $("pre_n").textContent = where;
+    if(NIN.drafted>0){
+      const acc = 100*NIN.accepted/NIN.drafted;
+      $("acc").textContent = acc.toFixed(1);
+      $("acc_u").textContent = "%";
+      meterSet($("acc_m"), acc, 50, 40);
+      $("acc_n").textContent = "of drafted tokens kept";
+    } else {
+      $("acc").textContent="—"; $("acc_u").textContent="";
+      meterSet($("acc_m"),0,50,40); $("acc_n").textContent="nothing drafted yet";
+    }
+  } else if(engine==="sglang" && s.metrics_available){
     // SGLang exposes different metric names; map onto the same cards.
     // Throughput is a live gauge (tok/s), not a counter to difference.
     // Mixed fleet seen from an SGLang lane: gen_throughput is already the
@@ -1212,6 +1443,20 @@ async function tick(){
     $("tmax_n").textContent = s.sglang_context_len>0
       ? "window · KV "+Math.round(100*(s.sglang_token_usage||0))+"%"
       : "tokens, high water";
+  } else if(NIN){
+    $("inflight").textContent = Math.round(NIN.running);
+    $("inflight_n").textContent = NIN.waiting>0 ? (NIN.waiting+" queued")
+                                : (NIN.running>0 ? "busy" : "idle");
+    const ch = NIN.prompt>0 ? 100*NIN.cached/NIN.prompt : 0;
+    $("hit").textContent = ch.toFixed(1);
+    meterSet($("hit_m"), ch, 60, 35);
+    $("hit_n").textContent = "prefix reused";
+    // Tokens per pass needs per-round counters the log does not carry.
+    $("tpp").textContent="—"; $("tpp_n").textContent="not in the engine log";
+    $("tmax").textContent = Math.round(NIN.max_prompt).toLocaleString();
+    $("tmax_n").textContent = NIN.ctx>0
+      ? ("largest prompt · window "+Math.round(NIN.ctx).toLocaleString())
+      : "largest prompt";
   } else if(noMetrics){
     $("inflight").textContent="—"; $("inflight_n").textContent=NP;
     $("hit").textContent="—";  $("hit_n").textContent=NP;
@@ -1268,16 +1513,25 @@ async function tick(){
 
 
   // --- per-stream table: render or show not-provided ---
-  if(noMetrics){
+  // A lane row is not a stream, but it IS what the engine reports about its
+  // own work, so a fleet with lane rows must render even when no /metrics
+  // answered: that is the only in-flight view an NInfer lane has.
+  if(noMetrics && !(s.lane_rows||[]).length){
     const box=document.getElementById("slots");
     box.innerHTML='<div class="quiet">not provided by this engine</div>';
     document.getElementById("slots_n").textContent="";
-  } else if(!prev){
+  } else if(!prev || noMetrics){
     renderSlots(s);
   }
 
   // --- lane identity: name, peers, title ---
-  if(s.name){ $("fname").textContent="· "+s.name;
+  // With more than one lane this page IS the fleet: every card, the
+  // Deployment table and the per-stream rows already cover both cards, so
+  // naming it after whichever lane you opened made two pages out of one.
+  if(((s.fleet&&s.fleet.lanes)||1)>1){
+    $("fname").textContent="· fleet";
+    $("pg_title").textContent="omp forwarder · fleet"; }
+  else if(s.name){ $("fname").textContent="· "+s.name;
     $("pg_title").textContent="omp forwarder · "+s.name; }
   else { $("fname").textContent="";
     $("pg_title").textContent="omp forwarder"; }

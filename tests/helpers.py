@@ -110,6 +110,10 @@ def reset_state() -> None:
     # Upstream health + deployment facts, refreshed by the sampler thread.
     fwd._upstream_healthy = False
     fwd._upstream_facts = {}
+    # The NInfer adapter's last read. Left set, it would give every later
+    # test a lane row and a recent list out of another test's fixture.
+    fwd._ninfer_stats = {}
+    fwd.UPSTREAM_LOG = None
     # The /__control auth token, generated in main().
     fwd._control_token = ""
     # Lane identity: --name and --peer flags.
