@@ -581,11 +581,15 @@ class FreshContainerPortTests(ForwarderCase):
 
     def test_a_port_is_only_skipped_while_it_listens(self):
         # TIME_WAIT is not a listener: the port is free and must stay usable,
-        # or a busy box would exhaust the range in an afternoon.
-        with mock.patch.object(fwd, "_run_host", return_value=_completed(_NETSTAT)), \
+        # or a busy box would exhaust the range in an afternoon. The range is
+        # narrowed to the three ports in the fixture so the answer is forced
+        # rather than drawn. Sampling the real 381-port range and asserting
+        # the one under test came up missed it about a third of the time.
+        with mock.patch.object(fwd, "CONTAINER_PORT_LO", 49610), \
+                mock.patch.object(fwd, "CONTAINER_PORT_HI", 49612), \
+                mock.patch.object(fwd, "_run_host", return_value=_completed(_NETSTAT)), \
                 mock.patch.object(fwd, "_taken_ports", return_value=set()):
-            seen = {fwd._free_container_port() for _ in range(400)}
-        self.assertIn(49612, seen)
+            self.assertEqual(fwd._free_container_port(), 49612)
 
     def test_no_free_port_is_reported_not_guessed(self):
         full = "\n".join(
