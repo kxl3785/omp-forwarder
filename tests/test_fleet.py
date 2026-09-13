@@ -292,8 +292,10 @@ class MergeSnapshotTests(ForwarderCase):
                                                          {"day": "2026-09-04", "prompt": 1, "cached": 1, "gen": 1}])
         m = stats.merge_snapshots(own, [peer])
         self.assertEqual(m["model"], "tune + candidate")
-        self.assertEqual(m["days"], [{"day": "2026-09-04", "prompt": 1, "cached": 1, "gen": 1},
-                                     {"day": "2026-09-05", "prompt": 11, "cached": 22, "gen": 33}])
+        # Newest first, as recent_days answers it: the usage page reads
+        # days[0] as today and the first seven as the last week.
+        self.assertEqual(m["days"], [{"day": "2026-09-05", "prompt": 11, "cached": 22, "gen": 33},
+                                     {"day": "2026-09-04", "prompt": 1, "cached": 1, "gen": 1}])
 
     def test_own_lane_fields_stay_own(self):
         own = self._lane(8890, control_token="mine", preset="llama-tune", gpu=0)

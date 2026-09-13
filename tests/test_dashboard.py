@@ -568,8 +568,17 @@ class SharedHeaderTests(ForwarderCase):
 
     def test_usage_page_contains_header_html(self):
         from omp_forwarder import usage
-        self.assertIn('id="peers"', usage.PAGE)
+        self.assertIn('id="fname"', usage.PAGE)
         self.assertIn('svg class="mark"', usage.PAGE)
+
+    def test_no_page_links_to_another_lane(self):
+        # Both pages read the fleet snapshot, so every lane is already on the
+        # page you have open. A pill or a row that opened the other card's
+        # copy of the same page made two pages out of one again.
+        from omp_forwarder import usage
+        for page in (stats.PAGE, usage.PAGE):
+            self.assertNotIn('id="peers"', page)
+            self.assertNotIn("http://127.0.0.1:", page)
 
 
 # ----------------------------------------------------------------
@@ -609,11 +618,18 @@ class PageMarkupTests(ForwarderCase):
         self.assertEqual(usage.PAGE.count(".tabs a.on"), 1)
 
     def test_usage_page_fills_the_shared_header(self):
-        # The usage page must fill lane name and peer pills from the same
-        # snapshot as the live dashboard.
+        # The usage page must name itself from the same snapshot as the live
+        # dashboard: "fleet" when more than one lane answers.
         from omp_forwarder import usage
         self.assertIn('$("fname")', usage.PAGE)
-        self.assertIn('$("peers")', usage.PAGE)
+        self.assertIn('"· fleet"', usage.PAGE)
+
+    def test_a_stale_session_baseline_is_dropped(self):
+        # The baseline lives in localStorage and outlives the counters. A
+        # counter below its own baseline means a restart, and the section
+        # must go back to lifetime instead of reading zero through traffic.
+        self.assertIn("function dropStaleBaselines(s)", stats.PAGE)
+        self.assertIn("dropStaleBaselines(s);", stats.PAGE)
 
     def test_draft_acceptance_unit_follows_value(self):
         # The % unit needs an id so the page can drop it when the value is

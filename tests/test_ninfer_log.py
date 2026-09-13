@@ -180,5 +180,58 @@ class NinferPresetLogTests(ForwarderCase):
         self.assertIsNone(fwd._preset_log({"port": "3000{gpu}"}, 0))
 
 
+class NinferTokenTallyTests(ForwarderCase):
+    """The Tokens card on an NInfer lane.
+
+    The engine publishes no token counters, so the forwarder folds its log's
+    finished requests into the same tally llama-server's /metrics feeds. The
+    card read zero through a day of real traffic before this existed."""
+
+    def _stats_for(self, events):
+        return stats.ninfer_log_stats("x", now=10.0,
+                                      reader=lambda path, n: _blob(events))
+
+    def test_a_finished_request_moves_the_tally(self):
+        nin = self._stats_for([_start(), _done(2000, 1, 500, 200, 60, 1.0)])
+        fwd._tally_ninfer_tokens(nin)
+        # prompt_tokens includes the cached prefix; the two must stay apart.
+        self.assertEqual(fwd._stats["tok_prompt"], 300)
+        self.assertEqual(fwd._stats["tok_cached"], 200)
+        self.assertEqual(fwd._stats["tok_gen"], 60)
+
+    def test_the_overlapping_tail_is_not_counted_twice(self):
+        first = [_start(), _done(2000, 1, 500, 200, 60, 1.0)]
+        fwd._tally_ninfer_tokens(self._stats_for(first))
+        second = first + [_done(3000, 2, 100, 0, 40, 1.0)]
+        fwd._tally_ninfer_tokens(self._stats_for(second))
+        self.assertEqual(fwd._stats["tok_prompt"], 400)
+        self.assertEqual(fwd._stats["tok_gen"], 100)
+
+    def test_a_restarted_engine_repeats_its_request_ids(self):
+        # Request 1 again, at a later timestamp: a different request.
+        fwd._tally_ninfer_tokens(self._stats_for([_done(2000, 1, 100, 0, 10, 1.0)]))
+        fwd._tally_ninfer_tokens(self._stats_for([_done(9000, 1, 100, 0, 10, 1.0)]))
+        self.assertEqual(fwd._stats["tok_gen"], 20)
+
+    def test_the_tail_that_was_already_there_is_a_baseline(self):
+        old = [_start(), _done(2000, 1, 500, 200, 60, 1.0)]
+        fwd._tally_ninfer_tokens(self._stats_for(old), baseline=True)
+        self.assertEqual(fwd._stats["tok_gen"], 0)
+        fwd._tally_ninfer_tokens(self._stats_for(old + [_done(3000, 2, 100, 0, 40, 1.0)]))
+        self.assertEqual(fwd._stats["tok_gen"], 40)
+
+    def test_an_empty_log_changes_nothing(self):
+        fwd._tally_ninfer_tokens({})
+        self.assertEqual(fwd._stats["tok_prompt"], 0)
+
+    def test_the_counted_set_stays_bounded(self):
+        fwd.NINFER_COUNTED_MAX = 5
+        self.addCleanup(setattr, fwd, "NINFER_COUNTED_MAX", 4000)
+        for i in range(20):
+            fwd._tally_ninfer_tokens(self._stats_for([_done(1000 + i, i, 10, 0, 1, 1.0)]))
+        self.assertLessEqual(len(fwd._ninfer_counted), 5)
+        self.assertEqual(fwd._stats["tok_gen"], 20)
+
+
 if __name__ == "__main__":
     unittest.main()

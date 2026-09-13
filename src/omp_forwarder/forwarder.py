@@ -192,6 +192,15 @@ _upstream_facts: dict = {}
 UPSTREAM_LOG: str | None = None
 #: What the sampler last read out of that log. The request path only copies it.
 _ninfer_stats: dict = {}
+#: The request keys already folded into the token tally, newest last. NInfer
+#: publishes no token counters, so its log is the only source; the tail the
+#: sampler reads overlaps the previous read, and this is what stops a request
+#: being counted twice. Bounded, because the process runs for days.
+_ninfer_counted: dict = {}
+NINFER_COUNTED_MAX = 4000
+#: The log path the tally has already baselined. A lane that switches preset
+#: gets a different log, and that log's existing tail is not our traffic.
+_ninfer_log_seen: str | None = None
 #: One random 32-hex string, generated at startup. The /__control endpoint
 #: requires it in the query string before it will mutate the container. The
 #: dashboard is loopback-only, but any web page the user visits can make the
@@ -565,7 +574,7 @@ def _sample_ninfer_log() -> None:
     Runs on the sampler thread beside the other probes. A missing file, or a
     log whose newest throughput record has gone stale, leaves the dashboard
     showing nothing rather than a number that was true a minute ago."""
-    global _ninfer_stats
+    global _ninfer_stats, _ninfer_log_seen
     from . import stats as stats_mod
     path = UPSTREAM_LOG
     if not path and _preset and FWD_GPU is not None:
@@ -576,6 +585,11 @@ def _sample_ninfer_log() -> None:
         _ninfer_stats = {}
         return
     _ninfer_stats = stats_mod.ninfer_log_stats(path, reader=_wsl_tail_reader())
+    # The tail that was already there when this lane came up is the baseline:
+    # recorded, not added. Every later read adds only what is new.
+    first = path != _ninfer_log_seen
+    _ninfer_log_seen = path
+    _tally_ninfer_tokens(_ninfer_stats, baseline=first)
 
 
 def _wsl_tail_reader():
@@ -1069,6 +1083,60 @@ def _tally_tokens(port: int | None, metrics: dict,
             t["cached"] = t.get("cached", 0) + dc
             t["gen"] += dg
             _days_dirty = True
+
+
+def _tally_ninfer_tokens(nin: dict, baseline: bool = False) -> None:
+    """Fold an NInfer lane's finished requests into the token tally.
+
+    NInfer answers no /metrics, so _tally_tokens never fires on such a lane
+    and the Tokens card read zero through a day of real traffic. The engine's
+    own log carries the same three numbers per request, so they come from
+    there instead: one request, counted once, keyed by id and timestamp.
+
+    prompt_tokens INCLUDES the cached prefix, and the dashboard needs the two
+    apart -- llama-server reports them disjoint and /__usage maps them onto a
+    paid API's input and cache-read lines. So the cached part is subtracted
+    out here rather than added twice.
+
+    baseline=True records the tail that was already there when we started
+    without adding it: that work was not ours. What it misses is a burst
+    large enough to push requests out of the 256 KB tail between two samples,
+    ten seconds apart. Nothing else reports those tokens at all."""
+    global _last_day, _days_dirty
+    done = (nin or {}).get("done") or []
+    if not done:
+        return
+    with _tok_lock:
+        dp = dc = dg = 0
+        for rec in done:
+            key = rec.get("key")
+            if key in _ninfer_counted:
+                continue
+            _ninfer_counted[key] = True
+            if baseline:
+                continue
+            cached = int(rec.get("cached", 0))
+            dp += max(0, int(rec.get("prompt", 0)) - cached)
+            dc += cached
+            dg += int(rec.get("gen", 0))
+        # Oldest keys first: dict preserves insertion order, and the log is
+        # read oldest-first, so trimming the front drops what cannot come back.
+        while len(_ninfer_counted) > NINFER_COUNTED_MAX:
+            _ninfer_counted.pop(next(iter(_ninfer_counted)))
+        if baseline or not (dp or dc or dg):
+            return
+        _stats["tok_prompt"] += dp
+        _stats["tok_cached"] += dc
+        _stats["tok_gen"] += dg
+        day = _today()
+        if _last_day and day != _last_day:
+            _log_day(_last_day)
+        _last_day = day
+        t = _day_totals.setdefault(day, {"prompt": 0, "cached": 0, "gen": 0})
+        t["prompt"] += dp
+        t["cached"] = t.get("cached", 0) + dc
+        t["gen"] += dg
+        _days_dirty = True
 
 
 def _sample_tokens(baseline: bool = False) -> None:

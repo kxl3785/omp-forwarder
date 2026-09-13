@@ -263,26 +263,14 @@ async function tick(){
   missed=0; document.body.classList.remove("stale");
   last=s; render(s);
 
-  // --- Lane identity: the shared header is filled from the same snapshot on
-  //     both pages, so the lane name and the peer pills render identically.
-  //     The live dashboard does the same thing; keeping the code identical
-  //     is what stops the two headers drifting apart.
-  if(s.name){ $("fname").textContent="· "+s.name; }
+  // --- Lane identity: this page reads the fleet snapshot, so its numbers
+  //     already cover every card. It names itself after the fleet for the
+  //     same reason the live dashboard does, and it offers no link to
+  //     another lane's copy of the same page.
+  const nl=(s.fleet&&s.fleet.lanes)||1;
+  if(nl>1){ $("fname").textContent="· fleet"; }
+  else if(s.name){ $("fname").textContent="· "+s.name; }
   else { $("fname").textContent=""; }
-  const pb=$("peers");
-  if(s.peers && s.peers.length){
-    pb.innerHTML=s.peers.map(pp=>{
-      const name=pp.name?("lane "+pp.name):("lane :"+pp.port);
-      const fx=pp.reachable
-        ? ((pp.engine&&pp.engine!=="unknown"?" "+pp.engine:"")
-           +((pp.thinking&&pp.thinking!=="unknown")?(" · "+pp.thinking):""))
-        : " unreachable";
-      const dot=pp.healthy?"on":"off";
-      return `<a class="lane" href="http://127.0.0.1:${pp.port}/__stats" target="_blank">`
-        +`<span class="pdot ${dot}"></span><span>${name}</span>`
-        +`<span class="pfx">${fx}</span></a>`;
-    }).join("");
-  } else { pb.innerHTML=""; }
 }
 tick(); setInterval(tick,5000);
 </script>

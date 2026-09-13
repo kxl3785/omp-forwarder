@@ -368,6 +368,20 @@ def ninfer_log_stats(path: str | None, now: float | None = None,
             "prefill": rates.get("prefill", 0.0) if fresh else 0.0,
         }
 
+    # --- every finished request in the tail, for the token tally ---
+    # The RECENT list below keeps the newest few. This list keeps them all,
+    # because the forwarder's token tally has to see each request exactly
+    # once and the tail it reads overlaps the previous read. The key is the
+    # id AND the timestamp: a restarted engine numbers its requests from one
+    # again, and an id alone would then look like a request already counted.
+    out["done"] = [{
+        "key": "%s@%s" % ((ev.get("request") or {}).get("request_id", "?"),
+                          ev.get("timestamp_unix_ms", 0)),
+        "prompt": (ev.get("result") or {}).get("prompt_tokens", 0),
+        "cached": (ev.get("result") or {}).get("prefix_cache_hit_tokens", 0),
+        "gen": (ev.get("result") or {}).get("completion_tokens", 0),
+    } for ev in done]
+
     # --- finished requests: the RECENT list and the cache evidence ---
     recent = []
     prompt = cached = completion = 0
@@ -571,7 +585,11 @@ def merge_snapshots(own: dict, peers: list) -> dict:
                                                  "prompt": 0, "cached": 0, "gen": 0})
             for k in ("prompt", "cached", "gen"):
                 row[k] += d.get(k) or 0
-    out["days"] = [days[k] for k in sorted(days)]
+    # Newest first, exactly as recent_days answers it. The usage page reads
+    # days[0] as today and days[0:7] as the last week; sorted ascending, the
+    # fleet page labelled today with the OLDEST day on record and summed the
+    # seven oldest as "last 7 days".
+    out["days"] = [days[k] for k in sorted(days, reverse=True)]
     return out
 
 
@@ -872,17 +890,11 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .fname{font-family:var(--mono);font-size:13px;color:var(--dim);
   margin-left:8px;font-weight:400}
 .tabsrow{display:flex;align-items:center;gap:16px;margin-top:10px}
-.tabsrow .peers{margin-left:auto}
-/* Peer pills: status dot + name (or ":PORT"), then a muted engine suffix. */
-.peers{display:flex;gap:6px;align-items:center}
-.peers a.lane{font-family:var(--mono);font-size:11px;color:var(--dim);
-  text-decoration:none;border:1px solid var(--line);border-radius:6px;
-  padding:2px 8px;display:inline-flex;align-items:center;gap:6px}
-.peers a.lane:hover{color:var(--teal);border-color:var(--teal)}
-.peers .pdot{width:6px;height:6px;border-radius:50%;display:inline-block}
-.peers .pdot.on{background:var(--green)}
-.peers .pdot.off{background:var(--red)}
-.peers .pfx{color:var(--dim);font-size:10px}
+/* There is no peer pill and no link to another lane's page. Both pages read
+   the fleet snapshot, so every lane is already on the page you have open;
+   a chip that jumped to the other card's copy of the same page only made
+   two pages out of one again. The Lanes panel names the cards. */
+.lane .pfx{color:var(--dim);font-size:10px}
 /* Lanes panel: one row per card, this lane first. */
 .lanes{display:flex;flex-direction:column;gap:6px;margin-bottom:22px}
 .recent{margin-top:14px;padding-top:12px;border-top:1px solid var(--line)}
@@ -900,7 +912,6 @@ h1{margin:0;font-size:25px;letter-spacing:-.02em;font-weight:650;
 .lane{display:grid;grid-template-columns:minmax(150px,1.1fr) 62px minmax(210px,1fr) auto minmax(80px,auto);
   gap:14px;align-items:center;padding:10px 14px;background:var(--panel);border:1px solid var(--line);
   border-radius:8px;font-family:var(--mono);font-size:12px}
-.lane.self{border-color:var(--teal)}
 .lane .ln b{color:var(--ink);font-weight:600}
 .lane .ln a{color:var(--teal);text-decoration:none}
 .lane .ln a:hover{text-decoration:underline}
@@ -948,7 +959,6 @@ _HEADER_HTML = """<div class="head">
 <div class="tabsrow">
 <nav class="tabs">{tabs}</nav>
 </div>
-<div class="peers" id="peers"></div>
 </div>"""
 
 _SVG_SYMBOLS = """<svg style="display:none">
@@ -960,7 +970,7 @@ _SVG_SYMBOLS = """<svg style="display:none">
 
 
 def header(on: str) -> str:
-    """The shared header: title, lane name, tab switch, peer pills.
+    """The shared header: title, lane name, tab switch.
     `on` is the tab that is lit on this page ("stats" or "usage")."""
     live = '<a class="on" href="/__stats">Live</a><a href="/__usage">Usage</a>'
     usage = '<a href="/__stats">Live</a><a class="on" href="/__usage">Usage</a>'
@@ -1208,6 +1218,27 @@ try{ const raw=localStorage.getItem(STORE); if(raw) base=Object.assign(base,JSON
 catch(e){ /* private window, or site data blocked -- run without a baseline */ }
 function persist(){ try{ localStorage.setItem(STORE,JSON.stringify(base)); }catch(e){} }
 
+// A baseline outlives the counters it was taken from. It lives in
+// localStorage, so it survives a reload, a forwarder restart and a model
+// reload -- and every one of those puts the counters back at zero. The
+// subtraction then clamps at zero and the whole section reads "0" through
+// real traffic, which is what it did on 2026-09-12: requests 0, connections
+// 0, tokens 0, beside a 21.9 s median round trip. A counter below its own
+// baseline can only mean a restart, so the baseline is dropped and the
+// section goes back to lifetime rather than lying.
+function dropStaleBaselines(s){
+  let changed=false;
+  for(const sect of ["model","server","fwd"]){
+    const b=base[sect]; if(!b) continue;
+    for(const k of KEYS[sect]){
+      if(typeof s[k]==="number" && typeof b[k]==="number" && s[k] < b[k]){
+        base[sect]=null; changed=true; break;
+      }
+    }
+  }
+  if(changed){ persist(); stampSince(); }
+}
+
 function adj(s,sect){
   const b=base[sect];
   if(!b) return s;
@@ -1252,6 +1283,7 @@ async function tick(){
   try{ s=await (await fetch("/__stats.json",{cache:"no-store"})).json(); }
   catch(e){ if(++missed>2) document.body.classList.add("stale"); return; }
   missed=0; document.body.classList.remove("stale");
+  dropStaleBaselines(s);
   const M=adj(s,"model"), S=adj(s,"server"), F=adj(s,"fwd");
   const noMetrics = !s.metrics_available;
 
@@ -1260,11 +1292,6 @@ async function tick(){
   const engineSuffix = engine==="llama-server" ? "llama-server"
                       : engine==="sglang"       ? "SGLang" : "upstream";
   const manyLanes=((s.fleet&&s.fleet.lanes)||1)>1;
-  // The peer pill belongs to the shared header, which the Usage page also
-  // uses. This page has the Lanes panel instead, so the pill is hidden here
-  // rather than removed from the fragment.
-  const pillEl=document.getElementById("peers");
-  if(pillEl) pillEl.style.display="none";
   const modelH=$("model_h");
   modelH.childNodes[0].textContent = manyLanes
     ? "Model — live, all lanes " : ("Model — live, from "+engineSuffix+" ");
@@ -1484,14 +1511,16 @@ async function tick(){
     else { $("tpp").textContent="—"; $("tpp_n").textContent="no passes yet"; }
   }
 
-  // --- GPU panel: one row per card, this lane's card marked ---
+  // --- GPU panel: one row per card, each named by the lane that owns it ---
   const gbox=document.getElementById("gpus");
   const gnote=document.getElementById("gpus_n");
   if(s.gpus && s.gpus.length){
     const thisGpu=s.gpu;
     // The lane marker is plain text: an icon-font glyph drew as a tofu box.
+    // Every card carries its lane's name, including the one this process
+    // serves. "this lane" made one of two identical rows look special.
     const lane=g=>{
-      if(g.index===thisGpu) return "this lane";
+      if(g.index===thisGpu) return s.name||("lane :"+s.listen);
       return (s.peers||[]).filter(pp=>pp.gpu===g.index)
         .map(pp=>pp.name||("lane :"+pp.port)).join(" · ");
     };
@@ -1524,7 +1553,7 @@ async function tick(){
     renderSlots(s);
   }
 
-  // --- lane identity: name, peers, title ---
+  // --- lane identity: name and title ---
   // With more than one lane this page IS the fleet: every card, the
   // Deployment table and the per-stream rows already cover both cards, so
   // naming it after whichever lane you opened made two pages out of one.
@@ -1603,7 +1632,7 @@ async function tick(){
       const ln=l.self?"":' data-lane="'+esc(l.port)+'"';
       const btns=(l.presets||[]).map(p=>'<button data-act="assign" data-preset="'+esc(p)+'"'+ln+'>'+esc(p)+'</button>').join("")
         +'<button data-act="stop" class="danger"'+ln+'>unload</button>';
-      return '<div class="lane'+(l.self?" self":"")+'" data-port="'+esc(l.port)+'"><span class="ln"></span><span class="lg"></span>'
+      return '<div class="lane" data-port="'+esc(l.port)+'"><span class="ln"></span><span class="lg"></span>'
         +'<span class="lp"></span><span class="ctl">'+btns+'</span><span class="ctl_msg"></span></div>';
     }).join("");
     lanesEl.dataset.built=lkey; wireCtl(lanesEl);
@@ -1611,8 +1640,11 @@ async function tick(){
   lanes.forEach(l=>{
     const row=lanesEl.querySelector('.lane[data-port="'+l.port+'"]'); if(!row) return;
     const nm=esc(l.name||("lane :"+l.port));
-    row.querySelector(".ln").innerHTML=(l.self?"<b>"+nm+"</b> <span class=\"pfx\">this page</span>"
-      :'<a href="http://127.0.0.1:'+esc(l.port)+'/__stats">'+nm+'</a>')+' <span class="pfx">:'+esc(l.port)+'</span>';
+    // Every lane reads the same on this page, and none of them is a link.
+    // The row you are looking at is not special: its buttons and the peer's
+    // buttons both post here, so marking one "this page" only invited the
+    // operator to go looking for the other card's page.
+    row.querySelector(".ln").innerHTML="<b>"+nm+"</b> <span class=\"pfx\">:"+esc(l.port)+"</span>";
     row.querySelector(".lg").textContent=(l.gpu===null||l.gpu===undefined)?"no gpu":("GPU "+l.gpu);
     const st=!l.reachable?"unreachable":(l.preset?(l.loading?"loading\u2026":(l.operator_stopped?"unloaded":(l.healthy?"serving":"failed \u00b7 not running"))):"none assigned");
     const lp=row.querySelector(".lp"); lp.textContent=(l.preset||"\u2014")+" \u00b7 "+st;

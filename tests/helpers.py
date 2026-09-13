@@ -114,6 +114,10 @@ def reset_state() -> None:
     # test a lane row and a recent list out of another test's fixture.
     fwd._ninfer_stats = {}
     fwd.UPSTREAM_LOG = None
+    # The token tally's dedupe set and its baseline mark. Left set, the next
+    # test's log fixture would be treated as already counted.
+    fwd._ninfer_counted = {}
+    fwd._ninfer_log_seen = None
     # The /__control auth token, generated in main().
     fwd._control_token = ""
     # Lane identity: --name and --peer flags.
