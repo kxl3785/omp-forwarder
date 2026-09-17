@@ -21,5 +21,10 @@ rem --gpu 0 / --peer 8891: this is the GPU 0 lane, and the GPU 1 lane runs on
 rem :8891. With both flags the Lanes panel shows both cards and a preset can
 rem be assigned here; without --gpu there is no card for a preset to land
 rem on, and without --peer the panel lists this lane alone.
-start "" /b pythonw.exe -m omp_forwarder --tray --upstream-exe .unsloth --gpu 0 --name "GPU 0" --peer 8891 >> "%OMP_FORWARDER_LOG%" 2>&1
+rem Each lane is skipped if its port already listens, so running this twice
+rem does not stack a second process on a lane that is up.
+netstat -ano | findstr /R /C:"127.0.0.1:8890 .*LISTENING" >nul || start "" /b pythonw.exe -m omp_forwarder --tray --upstream-exe .unsloth --gpu 0 --name "GPU 0" --peer 8891 >> "%OMP_FORWARDER_LOG%" 2>&1
+rem The GPU 1 lane. It has its own launcher, and nothing else starts it: a
+rem restart that ran only this file left GPU 1 empty and its row unreachable.
+netstat -ano | findstr /R /C:"127.0.0.1:8891 .*LISTENING" >nul || call "%~dp0run_forwarder_gpu1.bat"
 endlocal
